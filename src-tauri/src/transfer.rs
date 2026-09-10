@@ -1,0 +1,620 @@
+use std::fs;
+use std::io::{BufReader, BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use sha2::{Digest, Sha256};
+
+use crate::crypto::encrypt_file;
+use crate::progress::SpeedEstimator;
+use crate::repository::CatalogRepository;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreparedUpload {
+    pub transfer_id: String,
+    pub file_name: String,
+    pub local_path: String,
+    pub size_bytes: i64,
+    pub sha256: String,
+    pub duplicate: bool,
+    pub encrypted: bool,
+    pub status: String,
+}
+
+pub struct TransferService;
+
+impl TransferService {
+    #[cfg(test)]
+    pub fn prepare_upload(
+        repository: &CatalogRepository,
+        path: &str,
+        encrypt: bool,
+        passphrase: Option<String>,
+        staging_dir: &Path,
+    ) -> Result<PreparedUpload, String> {
+        Self::prepare_upload_in_folder(repository, path, encrypt, passphrase, staging_dir, None)
+    }
+
+    pub fn prepare_upload_in_folder(
+        repository: &CatalogRepository,
+        path: &str,
+        encrypt: bool,
+        passphrase: Option<String>,
+        staging_dir: &Path,
+        folder_id: Option<&str>,
+    ) -> Result<PreparedUpload, String> {
+        let source_path = normalize_path(path)?;
+        let metadata = fs::metadata(&source_path).map_err(|error| error.to_string())?;
+        if !metadata.is_file() {
+            return Err("La selección no es un archivo".to_string());
+        }
+        let size_bytes = i64::try_from(metadata.len())
+            .map_err(|_| "El archivo es demasiado grande para indexarlo".to_string())?;
+        if size_bytes <= 0 {
+            return Err("Telegram no permite subir archivos vacíos".to_string());
+        }
+        let file_name = source_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "No se pudo determinar el nombre del archivo".to_string())?
+            .to_string();
+        let transfer_id = new_transfer_id();
+
+        repository
+            .create_upload_placeholder_in_folder(
+                &transfer_id,
+                &file_name,
+                &source_path.to_string_lossy(),
+                size_bytes,
+                folder_id,
+            )
+            .map_err(|error| error.to_string())?;
+
+        Self::prepare_existing(
+            repository,
+            transfer_id,
+            file_name,
+            source_path,
+            size_bytes,
+            encrypt,
+            passphrase,
+            staging_dir,
+        )
+    }
+
+    pub fn resume_preparation(
+        repository: &CatalogRepository,
+        transfer_id: &str,
+        staging_dir: &Path,
+    ) -> Result<PreparedUpload, String> {
+        let Some((file_name, source, expected_size)) = repository
+            .preparation_source(transfer_id)
+            .map_err(|error| error.to_string())?
+        else {
+            return Err("La transferencia ya no necesita preparación".to_string());
+        };
+
+        let source_path = normalize_path(&source)?;
+        let metadata = fs::metadata(&source_path).map_err(|error| error.to_string())?;
+        if !metadata.is_file() || metadata.len() != expected_size as u64 {
+            return Err(
+                "El archivo original cambió o ya no está disponible. Selecciónalo de nuevo."
+                    .to_string(),
+            );
+        }
+
+        repository
+            .reset_preparation(transfer_id)
+            .map_err(|error| error.to_string())?;
+
+        Self::prepare_existing(
+            repository,
+            transfer_id.to_string(),
+            file_name,
+            source_path,
+            expected_size,
+            false,
+            None,
+            staging_dir,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_existing(
+        repository: &CatalogRepository,
+        transfer_id: String,
+        file_name: String,
+        source_path: PathBuf,
+        size_bytes: i64,
+        encrypt: bool,
+        passphrase: Option<String>,
+        staging_dir: &Path,
+    ) -> Result<PreparedUpload, String> {
+        let mut passphrase = passphrase.map(zeroize::Zeroizing::new);
+        repository
+            .update_runtime(
+                &transfer_id,
+                "analyzing",
+                "analyzing",
+                0,
+                size_bytes,
+                0,
+                None,
+                "Analizando archivo",
+                None,
+            )
+            .map_err(|error| error.to_string())?;
+
+        let sha256 = match hash_with_progress(repository, &transfer_id, &source_path, size_bytes) {
+            Ok(hash) => hash,
+            Err(error) => {
+                mark_preparation_failure(
+                    repository,
+                    &transfer_id,
+                    size_bytes,
+                    "Error al analizar",
+                    &error,
+                );
+                return Err(error);
+            }
+        };
+        let duplicate = repository
+            .has_hash(&sha256)
+            .map_err(|error| error.to_string())?;
+        if duplicate {
+            repository
+                .finish_preparation(
+                    &transfer_id,
+                    &source_path.to_string_lossy(),
+                    &sha256,
+                    size_bytes,
+                    true,
+                )
+                .map_err(|error| error.to_string())?;
+            return Ok(PreparedUpload {
+                transfer_id,
+                file_name,
+                local_path: source_path.to_string_lossy().into_owned(),
+                size_bytes,
+                sha256,
+                duplicate: true,
+                encrypted: false,
+                status: "duplicate".to_string(),
+            });
+        }
+
+        repository
+            .update_runtime(
+                &transfer_id,
+                "copying",
+                "copying",
+                0,
+                size_bytes,
+                0,
+                None,
+                "Copiando a caché privada",
+                None,
+            )
+            .map_err(|error| error.to_string())?;
+
+        let directory = staging_dir.join(&transfer_id);
+        if let Err(error) = fs::create_dir_all(&directory) {
+            let error = error.to_string();
+            mark_preparation_failure(
+                repository,
+                &transfer_id,
+                size_bytes,
+                "No se pudo crear la caché privada",
+                &error,
+            );
+            return Err(error);
+        }
+
+        let prepared_path = if encrypt {
+            let password = passphrase
+                .as_deref()
+                .map(|value| value.as_str())
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "Se necesita una contraseña para cifrar el archivo".to_string())?;
+            let encrypted_path = directory.join(format!("{file_name}.nuv"));
+            if let Err(error) = encrypt_file(&source_path, &encrypted_path, password) {
+                let error = error.to_string();
+                mark_preparation_failure(
+                    repository,
+                    &transfer_id,
+                    size_bytes,
+                    "Error al cifrar",
+                    &error,
+                );
+                return Err(error);
+            }
+            repository
+                .update_runtime(
+                    &transfer_id,
+                    "copying",
+                    "copying",
+                    size_bytes,
+                    size_bytes,
+                    0,
+                    Some(0),
+                    "Cifrado preparado",
+                    None,
+                )
+                .map_err(|error| error.to_string())?;
+            encrypted_path
+        } else {
+            let snapshot = directory.join(&file_name);
+            if let Err(error) = copy_with_progress(
+                repository,
+                &transfer_id,
+                &source_path,
+                &snapshot,
+                size_bytes,
+                &sha256,
+            ) {
+                mark_preparation_failure(
+                    repository,
+                    &transfer_id,
+                    size_bytes,
+                    "Error al copiar",
+                    &error,
+                );
+                return Err(error);
+            }
+            snapshot
+        };
+
+        passphrase.take();
+        let duplicate = repository
+            .finish_preparation(
+                &transfer_id,
+                &prepared_path.to_string_lossy(),
+                &sha256,
+                size_bytes,
+                false,
+            )
+            .map_err(|error| error.to_string())?;
+
+        Ok(PreparedUpload {
+            transfer_id,
+            file_name,
+            local_path: prepared_path.to_string_lossy().into_owned(),
+            size_bytes,
+            sha256,
+            duplicate,
+            encrypted: encrypt,
+            status: if duplicate { "duplicate" } else { "ready" }.to_string(),
+        })
+    }
+}
+
+fn mark_preparation_failure(
+    repository: &CatalogRepository,
+    transfer_id: &str,
+    size_bytes: i64,
+    label: &str,
+    error: &str,
+) {
+    if matches!(error, "Transferencia pausada" | "Transferencia cancelada") {
+        return;
+    }
+    let _ = repository.update_runtime(
+        transfer_id,
+        "failed",
+        "error",
+        0,
+        size_bytes,
+        0,
+        None,
+        label,
+        Some(error),
+    );
+}
+
+fn hash_with_progress(
+    repository: &CatalogRepository,
+    transfer_id: &str,
+    path: &Path,
+    total: i64,
+) -> Result<String, String> {
+    let mut reader = BufReader::with_capacity(
+        2 * 1024 * 1024,
+        fs::File::open(path).map_err(|e| e.to_string())?,
+    );
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    let mut processed = 0_i64;
+    let mut estimator = SpeedEstimator::new(0);
+    let mut last_report = Instant::now() - Duration::from_secs(1);
+
+    loop {
+        let read = reader.read(&mut buffer).map_err(|e| e.to_string())?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        processed += read as i64;
+        if last_report.elapsed() >= Duration::from_millis(250) || processed >= total {
+            check_control(repository, transfer_id)?;
+            let speed = estimator.update(processed);
+            let eta = SpeedEstimator::eta(total, processed, speed);
+            repository
+                .update_runtime(
+                    transfer_id,
+                    "analyzing",
+                    "analyzing",
+                    processed,
+                    total,
+                    speed,
+                    eta,
+                    "Analizando y calculando SHA-256",
+                    None,
+                )
+                .map_err(|e| e.to_string())?;
+            last_report = Instant::now();
+        }
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn copy_with_progress(
+    repository: &CatalogRepository,
+    transfer_id: &str,
+    source: &Path,
+    destination: &Path,
+    total: i64,
+    expected_hash: &str,
+) -> Result<(), String> {
+    let mut reader = BufReader::with_capacity(
+        2 * 1024 * 1024,
+        fs::File::open(source).map_err(|e| e.to_string())?,
+    );
+    let mut writer = BufWriter::with_capacity(
+        2 * 1024 * 1024,
+        fs::File::create(destination).map_err(|e| e.to_string())?,
+    );
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    let mut processed = 0_i64;
+    let mut estimator = SpeedEstimator::new(0);
+    let mut last_report = Instant::now() - Duration::from_secs(1);
+
+    loop {
+        let read = reader.read(&mut buffer).map_err(|e| e.to_string())?;
+        if read == 0 {
+            break;
+        }
+        writer
+            .write_all(&buffer[..read])
+            .map_err(|e| e.to_string())?;
+        hasher.update(&buffer[..read]);
+        processed += read as i64;
+        if last_report.elapsed() >= Duration::from_millis(250) || processed >= total {
+            check_control(repository, transfer_id)?;
+            let speed = estimator.update(processed);
+            repository
+                .update_runtime(
+                    transfer_id,
+                    "copying",
+                    "copying",
+                    processed,
+                    total,
+                    speed,
+                    SpeedEstimator::eta(total, processed, speed),
+                    "Copiando a caché privada",
+                    None,
+                )
+                .map_err(|e| e.to_string())?;
+            last_report = Instant::now();
+        }
+    }
+    writer.flush().map_err(|e| e.to_string())?;
+    if processed != total || hex::encode(hasher.finalize()) != expected_hash {
+        let _ = fs::remove_file(destination);
+        return Err("El archivo cambió mientras se preparaba. Inténtalo de nuevo.".to_string());
+    }
+    Ok(())
+}
+
+fn check_control(repository: &CatalogRepository, transfer_id: &str) -> Result<(), String> {
+    let control = repository
+        .transfer_control(transfer_id)
+        .map_err(|e| e.to_string())?;
+    if control.cancel_requested {
+        repository
+            .mark_cancelled(transfer_id)
+            .map_err(|e| e.to_string())?;
+        return Err("Transferencia cancelada".to_string());
+    }
+    if control.pause_requested {
+        repository
+            .mark_paused(transfer_id)
+            .map_err(|e| e.to_string())?;
+        return Err("Transferencia pausada".to_string());
+    }
+    Ok(())
+}
+
+pub(crate) fn normalize_path(input: &str) -> Result<PathBuf, String> {
+    if input.trim().is_empty() {
+        return Err("Ruta de archivo vacía".to_string());
+    }
+    if input.starts_with("content://") {
+        return Err(
+            "Android devolvió un URI no copiado; usa fileAccessMode='copy' en el selector"
+                .to_string(),
+        );
+    }
+
+    if input.starts_with("file://") {
+        return tauri::Url::parse(input)
+            .map_err(|_| "URL de archivo inválida".to_string())?
+            .to_file_path()
+            .map_err(|_| "La URL no corresponde a un archivo local".to_string());
+    }
+
+    Ok(Path::new(input).to_path_buf())
+}
+
+fn new_transfer_id() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let random: u64 = rand::random();
+    format!("transfer-{now:x}-{random:x}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_url_decodes_spaces_and_unicode() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("mi canción.txt");
+        let url = tauri::Url::from_file_path(&path).unwrap();
+        assert_eq!(normalize_path(url.as_str()).unwrap(), path);
+    }
+
+    #[test]
+    fn staging_failure_is_reported_as_failed_transfer() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.txt");
+        fs::write(&source, b"content").unwrap();
+        let staging = root.path().join("not-a-directory");
+        fs::write(&staging, b"occupied").unwrap();
+        let repo = CatalogRepository::open(&root.path().join("db")).unwrap();
+        assert!(TransferService::prepare_upload(
+            &repo,
+            source.to_str().unwrap(),
+            false,
+            None,
+            &staging
+        )
+        .is_err());
+        let job = repo.list_transfers().unwrap().remove(0);
+        assert_eq!(job.status, "failed");
+        assert!(job.error.is_some());
+    }
+
+    #[test]
+    fn file_url_is_normalized() {
+        #[cfg(target_os = "windows")]
+        assert_eq!(
+            normalize_path("file:///C:/tmp/a.txt").unwrap(),
+            PathBuf::from("C:/tmp/a.txt")
+        );
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(
+            normalize_path("file:///tmp/a.txt").unwrap(),
+            PathBuf::from("/tmp/a.txt")
+        );
+    }
+
+    #[test]
+    fn content_uri_is_rejected_without_copy_mode() {
+        assert!(normalize_path("content://example/file").is_err());
+    }
+
+    #[test]
+    fn prepare_upload_tracks_and_deduplicates() {
+        let root = std::env::temp_dir().join(format!("nuvio-transfer-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.txt");
+        fs::write(&source, b"qa transfer").unwrap();
+        let repository = CatalogRepository::open(&root.join("catalog.db")).unwrap();
+        let staging = root.join("staging");
+
+        let prepared = TransferService::prepare_upload(
+            &repository,
+            source.to_str().unwrap(),
+            false,
+            None,
+            &staging,
+        )
+        .unwrap();
+        assert_eq!(prepared.status, "ready");
+        assert!(Path::new(&prepared.local_path).exists());
+        let job = repository
+            .list_transfers()
+            .unwrap()
+            .into_iter()
+            .find(|t| t.id == prepared.transfer_id)
+            .unwrap();
+        assert_eq!(job.phase, "ready");
+        assert_eq!(job.total_bytes, b"qa transfer".len() as i64);
+        assert_eq!(job.processed_bytes, 0);
+
+        let duplicate = TransferService::prepare_upload(
+            &repository,
+            source.to_str().unwrap(),
+            false,
+            None,
+            &staging,
+        )
+        .unwrap();
+        assert!(duplicate.duplicate);
+        assert_eq!(duplicate.status, "duplicate");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn paused_preparation_can_resume_safely() {
+        let root = std::env::temp_dir().join(format!("nuvio-pause-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("large.bin");
+        fs::write(&source, vec![7_u8; 2 * 1024 * 1024]).unwrap();
+        let repository = CatalogRepository::open(&root.join("catalog.db")).unwrap();
+        let staging = root.join("staging");
+        let id = "transfer-paused";
+        let size = fs::metadata(&source).unwrap().len() as i64;
+
+        repository
+            .create_upload_placeholder(id, "large.bin", source.to_str().unwrap(), size)
+            .unwrap();
+        repository
+            .update_runtime(
+                id,
+                "analyzing",
+                "analyzing",
+                0,
+                size,
+                0,
+                None,
+                "Analizando",
+                None,
+            )
+            .unwrap();
+        repository.request_pause(id).unwrap();
+
+        let paused = hash_with_progress(&repository, id, &source, size);
+        assert!(paused.is_err());
+        let job = repository
+            .list_transfers()
+            .unwrap()
+            .into_iter()
+            .find(|job| job.id == id)
+            .unwrap();
+        assert_eq!(job.status, "paused");
+        assert!(repository.preparation_source(id).unwrap().is_some());
+
+        let resumed = TransferService::resume_preparation(&repository, id, &staging).unwrap();
+        assert_eq!(resumed.status, "ready");
+        assert!(Path::new(&resumed.local_path).exists());
+        assert!(repository.preparation_source(id).unwrap().is_none());
+        let job = repository
+            .list_transfers()
+            .unwrap()
+            .into_iter()
+            .find(|job| job.id == id)
+            .unwrap();
+        assert_eq!(job.status, "ready");
+        assert_eq!(job.processed_bytes, 0);
+
+        let _ = fs::remove_dir_all(root);
+    }
+}

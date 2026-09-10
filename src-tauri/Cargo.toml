@@ -1,0 +1,55 @@
+[package]
+name = "nuviodrive-v1"
+version = "1.0.0"
+description = "Nuvio private cloud client"
+authors = ["Nuvio"]
+edition = "2021"
+
+[lib]
+name = "nuviodrive_v1_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[target.'cfg(target_os = "android")'.build-dependencies]
+tdlib-rs = { version = "1.4.0", features = ["download-tdlib", "static"] }
+
+[target.'cfg(not(target_os = "android"))'.build-dependencies]
+tdlib-rs = { version = "1.4.0", features = ["download-tdlib"] }
+
+[dependencies]
+tauri = { version = "2", features = ["protocol-asset"] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.37", features = ["bundled"] }
+thiserror = "2"
+chacha20poly1305 = "0.10"
+argon2 = "0.5"
+sha2 = "0.10"
+hex = "0.4"
+rand = "0.9"
+zeroize = "1"
+tokio = { version = "1", features = ["time", "sync"] }
+tempfile = "3"
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+tauri-plugin-notification = "2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Security_Cryptography", "Win32_System_Memory"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+tdlib-rs = { version = "1.4.0", features = ["download-tdlib", "static"] }
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+tdlib-rs = { version = "1.4.0", features = ["download-tdlib"] }
+
+[profile.release]
+codegen-units = 8
+lto = "thin"
+opt-level = 3
+panic = "abort"
+strip = true

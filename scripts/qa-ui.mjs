@@ -1,0 +1,212 @@
+import { createRequire } from "node:module";
+import { mkdir, writeFile } from "node:fs/promises";
+import path from "node:path";
+import assert from "node:assert/strict";
+
+const require = createRequire(import.meta.url);
+const packageRoot = process.env.QA_PLAYWRIGHT_PATH || "playwright";
+const { chromium } = require(packageRoot);
+const { expect } = require(`${packageRoot}/test`);
+const browser = await chromium.launch({ channel: process.env.QA_BROWSER_CHANNEL || (process.platform === "win32" ? "msedge" : undefined), headless: true });
+const output = path.resolve("qa");
+await mkdir(output, { recursive: true });
+const results = [];
+const url = process.env.QA_BASE_URL || "http://127.0.0.1:1420";
+
+async function setup(viewport = { width: 1280, height: 820 }) {
+  const context = await browser.newContext({ viewport });
+  const page = await context.newPage();
+  const errors = [];
+  page.on("pageerror", error => errors.push(error.message));
+  await page.addInitScript(() => {
+    const files = Array.from({ length: 16 }, (_, index) => ({
+      id: `file-${index}`, name: index === 15 ? "LEEME" : `Archivo ${String(index).padStart(2, "0")} con nombre largo`,
+      extension: index < 2 ? "wav" : index === 15 ? "" : "txt",
+      kind: index < 2 ? "audio" : "document", sizeBytes: 1024 * (index + 1),
+      updatedAt: new Date(Date.UTC(2026, 8, 9, 0, 0, 16 - index)).toISOString(),
+      favorite: index === 2, trashed: false, folder: "Mi unidad", folderId: null, tags: [], provider: "telegram",
+    }));
+    window.__qa = { files, folders: [], calls: [], media: {}, dashboardError: null, dashboardPolls: 0 };
+    window.__TAURI_INTERNALS__ = {
+      convertFileSrc: file => `/qa-media/${file}`,
+      invoke: async (cmd, args = {}) => {
+        const qa = window.__qa;
+        qa.calls.push({ cmd, args });
+        if (cmd === "get_dashboard") {
+          qa.dashboardPolls++;
+          if (qa.dashboardError) throw qa.dashboardError;
+          return {
+            files: structuredClone(qa.files), folders: structuredClone(qa.folders), transfers: [], transferHistory: [], totalBytes: 20000, fileCount: qa.files.length,
+            favoriteCount: qa.files.filter(file => file.favorite && !file.trashed).length, recentCount: 12,
+            telegramConnected: true, telegramAccountLabel: "Cuenta QA", providerStatus: "Conectado · entorno de pruebas",
+            queueSummary: { total: 0, completed: 0, pending: 0, failed: 0, active: 0, processedBytes: 0, totalBytes: 0, speedBps: 0, cacheBytes: 0, cacheLimitBytes: 2147483648 },
+            settings: { preparationConcurrency: 2, uploadConcurrency: 1, downloadConcurrency: 2, cacheLimitBytes: 2147483648, rememberSession: false, conflictPolicy: "skip" },
+          };
+        }
+        if (cmd === "set_trashed") { qa.files.find(file => file.id === args.id).trashed = args.trashed; return; }
+        if (cmd === "platform_name") return "windows";
+        if (cmd === "create_folder") {
+          const id = `folder-${qa.folders.length}`;
+          qa.folders.push({id, name: args.name, parentId: args.parentId, trashed: false, fileCount: 0, childCount: 0, sizeBytes: 0, createdAt: 0, updatedAt: 0});
+          return id;
+        }
+        if (cmd === "move_files_to_folder") {
+          qa.files.filter(file => args.ids.includes(file.id)).forEach(file => { file.folderId = args.folderId; });
+          return args.ids.length;
+        }
+        if (cmd === "set_favorite") { qa.files.find(file => file.id === args.id).favorite = args.favorite; return; }
+        if (cmd === "prepare_media") return new Promise(resolve => { qa.media[args.id] = resolve; });
+        if (cmd === "telegram_auth_state") return { stage: "needsCredentials", connected: false, message: "Configura tus credenciales", isPremium: false };
+        if (cmd === "plugin:dialog|open") return null;
+        if (cmd.startsWith("plugin:notification|")) return false;
+        throw new Error(`Unexpected IPC call in QA: ${cmd}`);
+      },
+    };
+  });
+  await page.route("**/qa-media/**", route => route.fulfill({ status: 200, contentType: "audio/wav", body: Buffer.alloc(44) }));
+  await page.goto(url);
+  await expect(page.getByRole("heading", { name: "Inicio", exact: true })).toBeVisible();
+  return { context, page, errors };
+}
+
+async function test(name, fn, viewport) {
+  const { context, page, errors } = await setup(viewport);
+  try {
+    await fn(page);
+    assert.deepEqual(errors, [], "Browser raised an uncaught exception");
+    results.push({ name, status: "passed" });
+    console.log(`PASS ${name}`);
+  } catch (error) {
+    results.push({ name, status: "failed", error: error.message });
+    console.error(`FAIL ${name}: ${error.message}`);
+    await page.screenshot({ path: path.join(output, `${name}-failure.png`), fullPage: true });
+  } finally { await context.close(); }
+}
+
+try {
+  await test("selection-after-trash", async page => {
+    await page.getByRole("checkbox", { name: "Seleccionar Archivo 00 con nombre largo", exact: true }).check();
+    await page.locator(".file-card").first().getByTitle("Mover a Papelera", { exact: true }).click();
+    await expect(page.locator(".selection-count")).toHaveCount(0);
+  });
+  await test("folders-create-move-and-open", async page => {
+    await page.getByRole("navigation", {name: "Principal", exact: true}).getByRole("button", {name: "Mis archivos", exact: true}).click();
+    await page.getByRole("button", {name: "Nueva carpeta", exact: true}).click();
+    await page.getByRole("textbox", {name: "Nombre", exact: true}).fill("Fotos S24");
+    await page.getByRole("button", {name: "Crear carpeta", exact: true}).click();
+    await expect(page.locator(".folder-card")).toHaveCount(1);
+    await page.locator(".file-card").first().getByTitle("Mover a carpeta", {exact: true}).click();
+    await page.getByRole("combobox", {name: "Destino", exact: true}).selectOption("folder-0");
+    await page.getByRole("dialog").getByRole("button", {name: "Mover", exact: true}).click();
+    await expect(page.locator(".file-card")).toHaveCount(15);
+    await page.getByRole("button", {name: "Abrir Fotos S24", exact: true}).click();
+    await expect(page.locator(".file-card")).toHaveCount(1);
+    await expect(page.locator(".file-card")).toContainText("Archivo 00");
+  });
+  await test("pdf-preview-worker-and-memory-limit", async page => {
+    let pdf = "%PDF-1.7\n";
+    const stream = "0.2 0.4 0.8 rg 0 0 50000 50000 re f\n";
+    const objects = ["<< /Type /Catalog /Pages 2 0 R >>", "<< /Type /Pages /Kids [3 0 R] /Count 1 >>", "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 50000 50000] /Contents 4 0 R /Resources << >> >>", `<< /Length ${stream.length} >>\nstream\n${stream}endstream`];
+    const offsets = [0];
+    objects.forEach((object, index) => { offsets.push(pdf.length); pdf += `${index + 1} 0 obj\n${object}\nendobj\n`; });
+    const start = pdf.length;
+    pdf += `xref\n0 5\n0000000000 65535 f \n${offsets.slice(1).map(offset => `${String(offset).padStart(10, "0")} 00000 n \n`).join("")}trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n${start}\n%%EOF`;
+    await page.route("**/qa-media/large.pdf", route => route.fulfill({contentType: "application/pdf", body: pdf}));
+    await page.evaluate(() => { window.__qa.files[0].kind = "pdf"; window.__qa.files[0].extension = "pdf"; });
+    await expect(page.locator(".file-card").first().locator(".file-extension")).toHaveText("PDF");
+    await page.locator(".file-card").first().getByTitle("Vista previa", {exact: true}).click();
+    await page.evaluate(() => window.__qa.media["file-0"]({path: "large.pdf", fromCache: true}));
+    await expect(page.locator(".pdf-preview canvas")).toBeVisible();
+    await expect(page.locator(".preview-loading")).toHaveCount(0, {timeout: 30000});
+    await expect(page.locator(".media-modal [role=alert]")).toHaveCount(0);
+    assert.equal(await page.locator("canvas").evaluate(canvas => canvas.width > 0 && canvas.height > 0 && canvas.width * canvas.height <= 4_000_000 && canvas.width <= 4096), true);
+    await page.keyboard.press("Escape");
+    await expect(page.getByRole("dialog")).toHaveCount(0);
+  }, {width: 412, height: 915});
+  await test("selection-after-sort", async page => {
+    await page.getByRole("checkbox", { name: "Seleccionar Archivo 00 con nombre largo", exact: true }).check();
+    await page.getByRole("combobox", { name: "Ordenar" }).selectOption("oldest");
+    await expect(page.locator(".selection-count")).toHaveCount(0);
+  });
+  await test("theme-persists", async page => {
+    await page.getByRole("button", { name: "Cambiar tema", exact: true }).click();
+    await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+    await page.reload();
+    await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+  });
+  await test("media-close-and-stale-result", async page => {
+    await page.locator(".file-card").nth(0).getByTitle("Vista previa", { exact: true }).click();
+    await page.getByRole("button", { name: "Cerrar vista previa", exact: true }).click({ timeout: 2500 });
+    await expect(page.getByRole("dialog")).toHaveCount(0);
+    await page.locator(".file-card").nth(1).getByTitle("Vista previa", { exact: true }).click();
+    await page.evaluate(() => window.__qa.media["file-0"]({ path: "old.wav", fromCache: true }));
+    await expect(page.locator(".media-preparing")).toBeVisible();
+    await expect(page.locator("audio")).toHaveCount(0);
+    await page.evaluate(() => window.__qa.media["file-1"]({ path: "new.wav", fromCache: true }));
+    await expect(page.locator("audio")).toHaveAttribute("src", "/qa-media/new.wav");
+    await page.keyboard.press("Escape");
+    await expect(page.getByRole("dialog")).toHaveCount(0);
+  });
+  await test("modal-keyboard", async page => {
+    await page.getByRole("button", { name: "Ajustes", exact: true }).click();
+    await expect(page.getByRole("dialog")).toBeVisible();
+    await page.getByRole("button", { name: "Continuar con Telegram", exact: true }).focus();
+    await page.keyboard.press("Tab");
+    assert.equal(await page.evaluate(() => !!document.activeElement.closest('[role="dialog"]')), true);
+    await page.keyboard.press("Escape");
+    await expect(page.getByRole("dialog")).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Ajustes", exact: true })).toBeFocused();
+  });
+  await test("search-favorites-trash-and-list", async page => {
+    await page.getByRole("navigation", { name: "Principal", exact: true }).getByRole("button", { name: "Mis archivos", exact: true }).click();
+    await expect(page.locator(".file-card")).toHaveCount(16);
+    await page.getByRole("textbox", { name: "Buscar", exact: true }).fill("LEEME");
+    await expect(page.locator(".file-card")).toHaveCount(1);
+    await page.getByRole("button", { name: "Lista", exact: true }).click();
+    await expect(page.locator(".file-row-name strong")).toHaveText("LEEME");
+    for (const button of await page.locator(".row-actions button").all()) {
+      assert.ok((await button.getAttribute("aria-label")) || (await button.getAttribute("title")), "File action is missing an accessible name");
+    }
+    await page.getByRole("textbox", { name: "Buscar", exact: true }).fill("");
+    await page.getByRole("navigation", { name: "Principal", exact: true }).getByRole("button", { name: /Favoritos/ }).click();
+    await expect(page.locator(".file-row")).toHaveCount(1);
+  });
+  await test("boot-error-detail", async page => {
+    await page.addInitScript(() => { window.__qa.dashboardError = "No se pudo leer el catálogo de prueba"; });
+    await page.reload();
+    await expect(page.getByRole("alert")).toContainText("No se pudo leer el catálogo de prueba");
+    await page.evaluate(() => { window.__qa.dashboardError = null; });
+    await page.getByRole("button", { name: "Reintentar", exact: true }).click();
+    await expect(page.getByRole("heading", { name: "Inicio", exact: true })).toBeVisible();
+  });
+  await test("compact-dialog-and-api-validation", async page => {
+    await page.getByRole("button", { name: "Abrir menú", exact: true }).click();
+    await page.getByRole("button", { name: "Ajustes", exact: true }).click();
+    const dialog = page.getByRole("dialog");
+    await expect(dialog).toBeVisible();
+    const box = await dialog.boundingBox();
+    assert.ok(box.y >= 0 && box.y + box.height <= 390, "Dialog extends outside the viewport");
+    await page.getByLabel("API ID", { exact: true }).fill("2147483648");
+    await page.getByRole("button", { name: "Continuar con Telegram", exact: true }).click();
+    await expect(page.getByRole("alert")).toContainText("2147483647");
+    assert.equal(await page.evaluate(() => window.__qa.calls.some(call => call.cmd === "telegram_configure")), false);
+  }, { width: 844, height: 390 });
+  for (const width of [390, 768, 1280]) {
+    await test(`layout-${width}`, async page => {
+      const overflow = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth);
+      assert.equal(overflow, false, "Page has horizontal overflow");
+      await page.screenshot({ path: path.join(output, `ui-${width}.png`), fullPage: true });
+      if (width === 390) {
+        await page.getByRole("button", { name: "Abrir menú", exact: true }).click();
+        await page.getByRole("button", { name: "Ajustes", exact: true }).click();
+        await expect(page.getByRole("dialog")).toBeVisible();
+        await page.keyboard.press("Escape");
+        await expect(page.getByRole("dialog")).toHaveCount(0);
+      }
+    }, { width, height: 844 });
+  }
+} finally {
+  await browser.close();
+  await writeFile(path.join(output, "ui-results.json"), JSON.stringify(results, null, 2));
+}
+if (results.some(result => result.status === "failed")) process.exitCode = 1;

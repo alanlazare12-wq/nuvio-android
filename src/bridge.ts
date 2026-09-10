@@ -1,0 +1,277 @@
+import { invoke } from "@tauri-apps/api/core";
+import { onBackButtonPress } from "@tauri-apps/api/app";
+import { open, save } from "@tauri-apps/plugin-dialog";
+import type {
+  AppSettings,
+  BatchDownloadItem,
+  CloudFile,
+  DashboardData,
+  MediaReady,
+  PreparedUpload,
+  TelegramAuthSnapshot,
+} from "./types";
+
+export function loadDashboard(): Promise<DashboardData> {
+  return invoke<DashboardData>("get_dashboard");
+}
+
+export async function listenMobileBack(handler: () => void): Promise<() => void> {
+  if (await invoke<string>("platform_name") !== "android") return () => {};
+  const listener = await onBackButtonPress(handler);
+  return () => { void listener.unregister(); };
+}
+
+export function backgroundApp(): Promise<void> { return invoke("background_app"); }
+
+export async function setFavorite(id: string, favorite: boolean): Promise<void> {
+  await invoke("set_favorite", { id, favorite });
+}
+
+export function syncFiles(): Promise<number> {
+  return invoke("sync_files");
+}
+
+export function createFolder(name: string, parentId?: string | null): Promise<string> {
+  return invoke<string>("create_folder", { name, parentId: parentId ?? null });
+}
+
+export function renameFolder(id: string, name: string): Promise<void> {
+  return invoke("rename_folder", { id, name });
+}
+
+export function moveFolder(id: string, parentId?: string | null): Promise<void> {
+  return invoke("move_folder", { id, parentId: parentId ?? null });
+}
+
+export function deleteFolder(id: string): Promise<void> {
+  return invoke("delete_folder", { id });
+}
+
+export function moveFilesToFolder(ids: string[], folderId?: string | null): Promise<number> {
+  return invoke<number>("move_files_to_folder", { ids, folderId: folderId ?? null });
+}
+
+export function retryTransfer(id: string): Promise<void> {
+  return invoke("retry_transfer", { id });
+}
+
+export function pauseTransfer(id: string): Promise<void> {
+  return invoke("pause_transfer", { id });
+}
+
+export function cancelTransfer(id: string): Promise<void> {
+  return invoke("cancel_transfer", { id });
+}
+
+export function resumeTransfer(id: string): Promise<void> {
+  return invoke("resume_transfer", { id });
+}
+
+export function pauseQueue(): Promise<void> {
+  return invoke("pause_queue");
+}
+
+export function resumeQueue(): Promise<void> {
+  return invoke("resume_queue");
+}
+
+export function setTrashed(id: string, trashed: boolean): Promise<void> {
+  return invoke("set_trashed", { id, trashed });
+}
+
+export function setTrashedMany(ids: string[], trashed: boolean): Promise<number> {
+  return invoke<number>("set_trashed_many", { ids, trashed });
+}
+
+export function deleteFilesPermanently(ids: string[]): Promise<number> {
+  return invoke<number>("delete_files_permanently", { ids });
+}
+
+export function emptyTrash(): Promise<number> {
+  return invoke<number>("empty_trash");
+}
+
+export async function selectDownloadDirectory(): Promise<string | null> {
+  if (await invoke<string>("platform_name") === "android") {
+    return invoke<string | null>("pick_download_directory");
+  }
+  const selected = await open({
+    directory: true,
+    multiple: false,
+    title: "Elegir carpeta para las descargas de Nuvio",
+  });
+  return typeof selected === "string" ? selected : null;
+}
+
+export function queueDownloads(
+  ids: string[],
+  directory: string,
+  conflictPolicy?: "skip" | "rename",
+): Promise<BatchDownloadItem[]> {
+  return invoke<BatchDownloadItem[]>("queue_downloads", {
+    ids,
+    directory,
+    conflictPolicy: conflictPolicy ?? null,
+  });
+}
+
+export function prepareMedia(id: string): Promise<MediaReady> {
+  return invoke<MediaReady>("prepare_media", { id });
+}
+
+export function clearMediaCache(): Promise<number> {
+  return invoke<number>("clear_media_cache_command");
+}
+
+export function clearTransferHistory(): Promise<number> {
+  return invoke<number>("clear_transfer_history");
+}
+
+export async function exportDiagnostics(): Promise<boolean> {
+  const destination = await save({
+    title: "Exportar diagnóstico de Nuvio",
+    defaultPath: `nuvio-diagnostics-${new Date().toISOString().slice(0, 10)}.json`,
+    filters: [{ name: "JSON", extensions: ["json"] }],
+  });
+  if (!destination) return false;
+  await invoke("export_diagnostics", { destination });
+  return true;
+}
+
+export async function downloadFile(file: CloudFile): Promise<boolean> {
+  const directory = await selectDownloadDirectory();
+  if (!directory) return false;
+  const results = await queueDownloads([file.id], directory);
+  return results.some((item) => item.status === "queued");
+}
+
+export async function selectFilesForUpload(): Promise<string[]> {
+  const selected = await open({
+    multiple: true,
+    directory: false,
+    fileAccessMode: "copy",
+    title: "Seleccionar archivos para Nuvio",
+  });
+  if (!selected) return [];
+  return Array.isArray(selected) ? selected : [selected];
+}
+
+export function prepareUpload(
+  path: string,
+  encrypt = false,
+  passphrase?: string,
+  folderId?: string | null,
+): Promise<PreparedUpload> {
+  return invoke<PreparedUpload>("prepare_upload", {
+    path,
+    encrypt,
+    passphrase: passphrase ?? null,
+    folderId: folderId ?? null,
+  });
+}
+
+export type PreparedUploadResult =
+  | { ok: true; path: string; upload: PreparedUpload }
+  | { ok: false; path: string; error: string };
+
+export async function prepareUploadBatch(
+  paths: string[],
+  concurrency = 2,
+  onSettled?: (result: PreparedUploadResult, completed: number, total: number) => void,
+  folderId?: string | null,
+): Promise<PreparedUploadResult[]> {
+  const results = new Array<PreparedUploadResult>(paths.length);
+  let cursor = 0;
+  let completed = 0;
+  const workerCount = Math.max(1, Math.min(concurrency, paths.length));
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (true) {
+      const index = cursor++;
+      if (index >= paths.length) return;
+      const path = paths[index];
+      try {
+        results[index] = { ok: true, path, upload: await prepareUpload(path, false, undefined, folderId) };
+      } catch (error) {
+        results[index] = { ok: false, path, error: readableError(error) };
+      }
+      completed += 1;
+      onSettled?.(results[index], completed, paths.length);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+export async function decryptNuvioFile(
+  inputPath: string,
+  outputPath: string,
+  passphrase: string,
+): Promise<void> {
+  await invoke("decrypt_nuvio_file", { inputPath, outputPath, passphrase });
+}
+
+export function updateSetting(key: keyof AppSettings | string, value: string): Promise<AppSettings> {
+  return invoke<AppSettings>("update_setting", { key, value });
+}
+
+export function getTelegramAuthState(): Promise<TelegramAuthSnapshot> {
+  return invoke<TelegramAuthSnapshot>("telegram_auth_state");
+}
+
+export function configureTelegram(
+  apiId: number,
+  apiHash: string,
+  rememberSession: boolean,
+): Promise<TelegramAuthSnapshot> {
+  return invoke<TelegramAuthSnapshot>("telegram_configure", { apiId, apiHash, rememberSession });
+}
+
+export function submitTelegramPhone(phone: string): Promise<TelegramAuthSnapshot> {
+  return invoke<TelegramAuthSnapshot>("telegram_submit_phone", { phone });
+}
+
+export function submitTelegramEmail(email: string): Promise<TelegramAuthSnapshot> {
+  return invoke<TelegramAuthSnapshot>("telegram_submit_email", { email });
+}
+
+export function submitTelegramEmailCode(code: string): Promise<TelegramAuthSnapshot> {
+  return invoke<TelegramAuthSnapshot>("telegram_submit_email_code", { code });
+}
+
+export function submitTelegramCode(code: string): Promise<TelegramAuthSnapshot> {
+  return invoke<TelegramAuthSnapshot>("telegram_submit_code", { code });
+}
+
+export function submitTelegramPassword(password: string): Promise<TelegramAuthSnapshot> {
+  return invoke<TelegramAuthSnapshot>("telegram_submit_password", { password });
+}
+
+export function requestTelegramQr(): Promise<TelegramAuthSnapshot> {
+  return invoke<TelegramAuthSnapshot>("telegram_request_qr");
+}
+
+export function registerTelegramUser(
+  firstName: string,
+  lastName: string,
+): Promise<TelegramAuthSnapshot> {
+  return invoke<TelegramAuthSnapshot>("telegram_register_user", { firstName, lastName });
+}
+
+export function logOutTelegram(): Promise<TelegramAuthSnapshot> {
+  return invoke<TelegramAuthSnapshot>("telegram_log_out");
+}
+
+export function forgetTelegramSession(): Promise<TelegramAuthSnapshot> {
+  return invoke<TelegramAuthSnapshot>("telegram_forget_session");
+}
+
+export function readableError(value: unknown): string {
+  if (typeof value === "string" && value.trim()) return value;
+  if (value instanceof Error && value.message.trim()) return value.message;
+  try {
+    const message = JSON.stringify(value);
+    return message && message !== "null" && message !== '""' ? message : "Ocurrió un error inesperado";
+  } catch {
+    return "Ocurrió un error inesperado";
+  }
+}

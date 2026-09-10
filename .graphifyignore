@@ -1,0 +1,14 @@
+node_modules/
+dist/
+release/
+qa/
+graphify-out/
+.release-signing/
+src-tauri/target/
+src-tauri/windows-runtime/
+src-tauri/gen/
+*.log
+*.png
+*.zip
+*.bak*
+*.before-*
