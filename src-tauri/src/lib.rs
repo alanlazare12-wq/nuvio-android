@@ -527,6 +527,27 @@ async fn empty_trash(state: State<'_, Arc<AppState>>) -> Result<usize, String> {
 }
 
 #[tauri::command]
+async fn prepare_thumbnail(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+) -> Result<Option<media::ThumbnailSource>, String> {
+    static SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+    let _slot = SLOTS.acquire().await.map_err(|e| e.to_string())?;
+    let settings = state.repository.settings().map_err(|e| e.to_string())?;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(45),
+        state.telegram.prepare_thumbnail(
+            &state.repository,
+            &id,
+            &state.media_cache_dir,
+            settings.cache_limit_bytes,
+        ),
+    )
+    .await
+    .map_err(|_| "Miniatura no disponible por ahora".to_string())?
+}
+
+#[tauri::command]
 async fn prepare_media(state: State<'_, Arc<AppState>>, id: String) -> Result<MediaReady, String> {
     let settings = state.repository.settings().map_err(|e| e.to_string())?;
     state
@@ -970,6 +991,7 @@ pub fn run() {
             delete_files_permanently,
             empty_trash,
             prepare_media,
+            prepare_thumbnail,
             clear_media_cache_command,
             clear_transfer_history,
             export_diagnostics,

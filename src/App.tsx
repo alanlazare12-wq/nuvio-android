@@ -106,6 +106,7 @@ import type {
 } from "./types";
 import "./App.css";
 import { Dialog } from "./Dialog";
+import { FileThumbnail, clearThumbnailCache } from "./FileThumbnail";
 
 GlobalWorkerOptions.workerSrc = pdfWorker;
 
@@ -266,11 +267,6 @@ function isTransferPending(job: TransferJob) {
   return !["completed", "failed", "duplicate", "cancelled"].includes(job.status);
 }
 
-const isMobileOrTouch = typeof window !== "undefined" && (
-  /android|iphone|ipad|ipod/i.test(navigator.userAgent) ||
-  (navigator.maxTouchPoints > 0 && window.matchMedia("(max-width: 920px)").matches)
-);
-
 function App() {
   const [dashboard, setDashboard] = useState<DashboardData | null>(null);
   const [section, setSection] = useState<SectionKey>("home");
@@ -299,6 +295,7 @@ function App() {
   const [mediaError, setMediaError] = useState<string | null>(null);
   const [draggingFileIds, setDraggingFileIds] = useState<string[]>([]);
   const draggingFileIdsRef = useRef<string[]>([]);
+  const suppressClickUntilRef = useRef(0);
   const [dragTarget, setDragTarget] = useState<string | null>(null);
   const [touchDragPosition, setTouchDragPosition] = useState<{ x: number; y: number } | null>(null);
   const touchDragRef = useRef<{
@@ -313,6 +310,47 @@ function App() {
     timer: number | null;
     element: HTMLElement;
   } | null>(null);
+  useEffect(() => {
+    // A non-passive listener keeps a long press from turning into a browser pan.
+    const stopPan = (event: TouchEvent) => {
+      if (touchDragRef.current?.active && event.cancelable) event.preventDefault();
+    };
+    const cancel = () => clearFileDrag();
+    document.addEventListener("touchmove", stopPan, { passive: false });
+    const escape = (event: KeyboardEvent) => { if (event.key === "Escape" && touchDragRef.current) clearFileDrag(); };
+    window.addEventListener("keydown", escape);
+    window.addEventListener("blur", cancel);
+    return () => {
+      document.removeEventListener("touchmove", stopPan);
+      window.removeEventListener("blur", cancel);
+      window.removeEventListener("keydown", escape);
+      const touch = touchDragRef.current;
+      if (touch?.timer != null) clearTimeout(touch.timer);
+    };
+  }, []);
+  useEffect(() => { if (!dashboard?.telegramConnected) clearThumbnailCache(); }, [dashboard?.telegramConnected]);
+  useEffect(() => {
+    if (!draggingFileIds.length || !touchDragPosition) return;
+    let frame = 0;
+    const scroll = () => {
+      const touch = touchDragRef.current;
+      if (!touch?.active) return;
+      const content = document.querySelector<HTMLElement>(".content-scroll");
+      const scroller = content && getComputedStyle(content).overflowY === "auto" ? content : document.scrollingElement;
+      if (scroller) {
+        const top = scroller === content ? Math.max(0, content!.getBoundingClientRect().top) : 0;
+        const bottom = scroller === content ? Math.min(innerHeight, content!.getBoundingClientRect().bottom) : innerHeight;
+        const delta = touch.lastY < top + 64 ? -14 : touch.lastY > bottom - 64 ? 14 : 0;
+        if (delta) {
+          scroller.scrollTop += delta;
+          setDragTarget(dropTargetKeyAt(touch.lastX, touch.lastY));
+        }
+      }
+      frame = requestAnimationFrame(scroll);
+    };
+    frame = requestAnimationFrame(scroll);
+    return () => cancelAnimationFrame(frame);
+  }, [draggingFileIds.length, !!touchDragPosition]);
   const filterTabsRef = useRef<HTMLDivElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const fileSearchInputRef = useRef<HTMLInputElement>(null);
@@ -618,6 +656,10 @@ function App() {
     setMediaError(null);
     setMediaBusy(true);
     try {
+      if ((file.kind === "text" || file.kind === "code") && file.sizeBytes > 2 * 1024 * 1024) {
+        setMediaError("La vista previa de texto está limitada a 2 MB. Descarga el archivo para verlo completo.");
+        return;
+      }
       const ready = await prepareMedia(file.id);
       if (request !== mediaRequestRef.current) return;
       const source = convertFileSrc(ready.path);
@@ -647,6 +689,7 @@ function App() {
   const handleClearCache = async () => {
     try {
       const released = await clearMediaCache();
+      clearThumbnailCache();
       setAppNotice(`Caché multimedia limpiada · ${formatBytes(released)} liberados.`);
       closeMedia();
       await refreshDashboard();
@@ -717,6 +760,8 @@ function App() {
   const clearFileDrag = () => {
     draggingFileIdsRef.current = [];
     const touch = touchDragRef.current;
+    if (touch?.active) suppressClickUntilRef.current = Date.now() + 400;
+    if (touch?.element.hasPointerCapture(touch.pointerId)) touch.element.releasePointerCapture(touch.pointerId);
     if (touch?.timer != null) window.clearTimeout(touch.timer);
     touchDragRef.current = null;
     setDraggingFileIds([]);
@@ -764,6 +809,7 @@ function App() {
       return;
     }
     const ids = dragIdsFor(file);
+    suppressClickUntilRef.current = Date.now() + 400;
     event.dataTransfer.effectAllowed = "move";
     event.dataTransfer.setData("application/x-nuvio-files", JSON.stringify(ids));
     event.dataTransfer.setData("text/plain", ids.join(","));
@@ -789,18 +835,8 @@ function App() {
   };
 
   const dropTargetKeyAt = (x: number, y: number): string | null => {
-    if (x == null || y == null) return null;
-    const element = document.elementFromPoint(x, y)?.closest<HTMLElement>("[data-nuvio-drop-folder]");
-    if (element?.dataset.nuvioDropFolder) return element.dataset.nuvioDropFolder;
-
-    const targets = document.querySelectorAll<HTMLElement>("[data-nuvio-drop-folder]");
-    for (let i = 0; i < targets.length; i++) {
-      const rect = targets[i].getBoundingClientRect();
-      if (x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom) {
-        return targets[i].dataset.nuvioDropFolder ?? null;
-      }
-    }
-    return null;
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+    return document.elementFromPoint(x, y)?.closest<HTMLElement>("[data-nuvio-drop-folder]")?.dataset.nuvioDropFolder ?? null;
   };
 
   const activateTouchDrag = (event: React.PointerEvent<HTMLElement>) => {
@@ -823,8 +859,8 @@ function App() {
   const touchDragStart = (event: React.PointerEvent<HTMLElement>, file: CloudFile) => {
     if (event.pointerType === "mouse" || file.trashed) return;
     const interactive = (event.target as Element).closest("button,input,label,select,a");
-    const explicitHandle = (event.target as Element).closest("[data-file-drag-handle]");
-    if (interactive && !explicitHandle) return;
+    if (interactive || !event.isPrimary) return;
+    clearFileDrag();
     const ids = dragIdsFor(file);
     const state = {
       pointerId: event.pointerId,
@@ -839,9 +875,7 @@ function App() {
       element: event.currentTarget,
     };
     touchDragRef.current = state;
-    if (explicitHandle) {
-      activateTouchDrag(event);
-    } else {
+    if (!selectedFiles.has(file.id)) {
       state.timer = window.setTimeout(() => {
         const current = touchDragRef.current;
         if (!current || current.pointerId !== event.pointerId || current.active) return;
@@ -866,12 +900,14 @@ function App() {
     if (!touch || touch.pointerId !== event.pointerId) return;
     if (!touch.active) {
       const distance = Math.hypot(event.clientX - touch.startX, event.clientY - touch.startY);
-      if (distance > 12 && touch.timer != null) {
+      if (distance > 6 && touch.timer == null) {
+        activateTouchDrag(event);
+      } else if (distance > 12 && touch.timer != null) {
         window.clearTimeout(touch.timer);
         touch.timer = null;
         touchDragRef.current = null;
       }
-      return;
+      if (!touch.active) return;
     }
     event.preventDefault();
     touch.lastX = event.clientX;
@@ -891,11 +927,9 @@ function App() {
       return;
     }
     event.preventDefault();
-    const x = event.clientX || touch.lastX || touch.startX;
-    const y = event.clientY || touch.lastY || touch.startY;
-    const key = dropTargetKeyAt(x, y) ?? touch.lastTarget ?? dragTarget;
+    const key = dropTargetKeyAt(event.clientX, event.clientY);
     const ids = touch.ids;
-    touchDragRef.current = null;
+    clearFileDrag();
     if (key == null) {
       clearFileDrag();
       setAppNotice("Movimiento cancelado.");
@@ -981,6 +1015,7 @@ function App() {
   };
 
   const toggleSelection = (id: string) => {
+    if (Date.now() < suppressClickUntilRef.current) return;
     setSelectedFiles((current) => {
       const next = new Set(current);
       if (next.has(id)) next.delete(id); else next.add(id);
@@ -1270,9 +1305,9 @@ function App() {
                 )}
               </div>
             ) : files.length === 0 ? null : view === "grid" ? (
-              <div className="file-grid">{files.map((file) => <FileCard key={file.id} file={file} selected={selectedFiles.has(file.id)} isDragging={draggingFileIds.includes(file.id)} onSelect={() => toggleSelection(file.id)} onFavorite={() => void action(() => setFavorite(file.id, !file.favorite))} onDownload={() => void handleBulkDownload([file.id])} onPreview={() => void handleMedia(file)} onMove={() => setMoveDialog({ kind: "files", ids: [file.id] })} onTrash={() => void action(() => setTrashed(file.id, !file.trashed))} onDelete={() => void handlePermanentDelete([file.id])} onDragStart={(event) => desktopDragStart(event, file)} onDragEnd={clearFileDrag} onPointerDown={(event) => touchDragStart(event, file)} onPointerMove={touchDragMove} onPointerUp={touchDragEnd} onPointerCancel={() => clearFileDrag()} />)}</div>
+              <div className="file-grid">{files.map((file) => <FileCard key={file.id} file={file} selected={selectedFiles.has(file.id)} isDragging={draggingFileIds.includes(file.id)} onSelect={() => toggleSelection(file.id)} onFavorite={() => void action(() => setFavorite(file.id, !file.favorite))} onDownload={() => void handleBulkDownload([file.id])} onPreview={() => void handleMedia(file)} onMove={() => setMoveDialog({ kind: "files", ids: [file.id] })} onTrash={() => void action(() => setTrashed(file.id, !file.trashed))} onDelete={() => void handlePermanentDelete([file.id])} onDragStart={(event) => desktopDragStart(event, file)} onDragEnd={clearFileDrag} onPointerDown={(event) => touchDragStart(event, file)} onPointerMove={touchDragMove} onPointerUp={touchDragEnd} onPointerCancel={() => { if (touchDragRef.current) clearFileDrag(); }} />)}</div>
             ) : (
-              <div className="file-list"><div className="file-list-head"><span>Nombre</span><span>Ubicación</span><span>Tamaño</span><span>Modificado</span><span /></div>{files.map((file) => <FileRow key={file.id} file={file} selected={selectedFiles.has(file.id)} isDragging={draggingFileIds.includes(file.id)} onSelect={() => toggleSelection(file.id)} onFavorite={() => void action(() => setFavorite(file.id, !file.favorite))} onDownload={() => void handleBulkDownload([file.id])} onPreview={() => void handleMedia(file)} onMove={() => setMoveDialog({ kind: "files", ids: [file.id] })} onTrash={() => void action(() => setTrashed(file.id, !file.trashed))} onDelete={() => void handlePermanentDelete([file.id])} onDragStart={(event) => desktopDragStart(event, file)} onDragEnd={clearFileDrag} onPointerDown={(event) => touchDragStart(event, file)} onPointerMove={touchDragMove} onPointerUp={touchDragEnd} onPointerCancel={() => clearFileDrag()} />)}</div>
+              <div className="file-list"><div className="file-list-head"><span>Nombre</span><span>Ubicación</span><span>Tamaño</span><span>Modificado</span><span /></div>{files.map((file) => <FileRow key={file.id} file={file} selected={selectedFiles.has(file.id)} isDragging={draggingFileIds.includes(file.id)} onSelect={() => toggleSelection(file.id)} onFavorite={() => void action(() => setFavorite(file.id, !file.favorite))} onDownload={() => void handleBulkDownload([file.id])} onPreview={() => void handleMedia(file)} onMove={() => setMoveDialog({ kind: "files", ids: [file.id] })} onTrash={() => void action(() => setTrashed(file.id, !file.trashed))} onDelete={() => void handlePermanentDelete([file.id])} onDragStart={(event) => desktopDragStart(event, file)} onDragEnd={clearFileDrag} onPointerDown={(event) => touchDragStart(event, file)} onPointerMove={touchDragMove} onPointerUp={touchDragEnd} onPointerCancel={() => { if (touchDragRef.current) clearFileDrag(); }} />)}</div>
             )}
           </section>}
         </div>
@@ -1609,11 +1644,11 @@ type FileActions = {
 
 function FileCard({ file, selected, isDragging, onSelect, onFavorite, onDownload, onPreview, onMove, onTrash, onDelete, onDragStart, onDragEnd, onPointerDown, onPointerMove, onPointerUp, onPointerCancel }: FileActions) {
   const Icon = kindIcon(file.kind);
-  return <article className={`file-card ${selected ? "selected" : ""} ${isDragging ? "is-touch-dragging" : ""}`} draggable={!isMobileOrTouch && !file.trashed} onDragStart={onDragStart} onDragEnd={onDragEnd} onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp} onPointerCancel={onPointerCancel}>
+  const [nativeDrag, setNativeDrag] = useState(false);
+  return <article className={`file-card ${selected ? "selected" : ""} ${isDragging ? "is-touch-dragging" : ""}`} draggable={nativeDrag && !file.trashed} tabIndex={0} aria-label={fileName(file)} onClick={(event) => { if (!(event.target as Element).closest("button,input,label,select,a")) onSelect(); }} onKeyDown={(event) => { if (event.target === event.currentTarget && event.key === " ") { event.preventDefault(); onSelect(); } }} onDragStart={onDragStart} onDragEnd={onDragEnd} onPointerDown={(event) => { setNativeDrag(event.pointerType === "mouse"); onPointerDown(event); }} onPointerMove={onPointerMove} onPointerUp={onPointerUp} onPointerCancel={onPointerCancel}>
     <div className={`file-preview kind-${file.kind}`}>
       <label className="file-select-checkbox"><input type="checkbox" checked={selected} onChange={onSelect} aria-label={`Seleccionar ${file.name}`} /></label>
-      {!file.trashed && <span className="touch-drag-handle" data-file-drag-handle aria-hidden="true"><Move size={15} /></span>}
-      <div className="file-type-icon"><Icon size={27} strokeWidth={1.7} /></div>
+      <FileThumbnail file={file}><div className="file-type-icon"><Icon size={27} strokeWidth={1.7} /></div></FileThumbnail>
       <span className="file-extension">{file.extension.toUpperCase()}</span>
       <button className={`favorite-button ${file.favorite ? "active" : ""}`} onClick={onFavorite} aria-label="Favorito" aria-pressed={file.favorite}><Star size={16} fill={file.favorite ? "currentColor" : "none"} /></button>
     </div>
@@ -1635,11 +1670,11 @@ function FileCard({ file, selected, isDragging, onSelect, onFavorite, onDownload
 
 function FileRow({ file, selected, isDragging, onSelect, onFavorite, onDownload, onPreview, onMove, onTrash, onDelete, onDragStart, onDragEnd, onPointerDown, onPointerMove, onPointerUp, onPointerCancel }: FileActions) {
   const Icon = kindIcon(file.kind);
-  return <article className={`file-row ${selected ? "selected" : ""} ${isDragging ? "is-touch-dragging" : ""}`} draggable={!isMobileOrTouch && !file.trashed} onDragStart={onDragStart} onDragEnd={onDragEnd} onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp} onPointerCancel={onPointerCancel}>
+  const [nativeDrag, setNativeDrag] = useState(false);
+  return <article className={`file-row ${selected ? "selected" : ""} ${isDragging ? "is-touch-dragging" : ""}`} draggable={nativeDrag && !file.trashed} tabIndex={0} aria-label={fileName(file)} onClick={(event) => { if (!(event.target as Element).closest("button,input,label,select,a")) onSelect(); }} onKeyDown={(event) => { if (event.target === event.currentTarget && event.key === " ") { event.preventDefault(); onSelect(); } }} onDragStart={onDragStart} onDragEnd={onDragEnd} onPointerDown={(event) => { setNativeDrag(event.pointerType === "mouse"); onPointerDown(event); }} onPointerMove={onPointerMove} onPointerUp={onPointerUp} onPointerCancel={onPointerCancel}>
     <div className="file-row-name">
-      {!file.trashed && <span className="touch-drag-handle row-drag-handle" data-file-drag-handle aria-hidden="true"><Move size={14} /></span>}
       <input type="checkbox" checked={selected} onChange={onSelect} aria-label={`Seleccionar ${file.name}`} />
-      <div className={`small-file-icon kind-${file.kind}`}><Icon size={18} /></div>
+      <div className={`small-file-icon kind-${file.kind}`}><FileThumbnail file={file}><Icon size={18} /></FileThumbnail></div>
       <div><strong title={fileName(file)}>{fileName(file)}</strong><small>{kindLabel(file.kind)}</small></div>
     </div>
     <span>{file.folder}</span><span>{formatBytes(file.sizeBytes)}</span><span>{relativeDate(file.updatedAt)}</span>

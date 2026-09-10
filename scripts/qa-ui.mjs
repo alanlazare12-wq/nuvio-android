@@ -14,7 +14,7 @@ const results = [];
 const url = process.env.QA_BASE_URL || "http://127.0.0.1:1420";
 
 async function setup(viewport = { width: 1280, height: 820 }) {
-  const context = await browser.newContext({ viewport });
+  const context = await browser.newContext({ viewport, hasTouch: viewport.width < 600, isMobile: viewport.width < 600 });
   const page = await context.newPage();
   const errors = [];
   page.on("pageerror", error => errors.push(error.message));
@@ -56,6 +56,7 @@ async function setup(viewport = { width: 1280, height: 820 }) {
         }
         if (cmd === "set_favorite") { qa.files.find(file => file.id === args.id).favorite = args.favorite; return; }
         if (cmd === "prepare_media") return new Promise(resolve => { qa.media[args.id] = resolve; });
+        if (cmd === "prepare_thumbnail") return qa.thumbnails?.[args.id] ?? null;
         if (cmd === "telegram_auth_state") return { stage: "needsCredentials", connected: false, message: "Configura tus credenciales", isPremium: false };
         if (cmd === "plugin:dialog|open") return null;
         if (cmd.startsWith("plugin:notification|")) return false;
@@ -123,6 +124,76 @@ try {
     await page.keyboard.press("Escape");
     await expect(page.getByRole("dialog")).toHaveCount(0);
   }, {width: 412, height: 915});
+  async function makeDropFolder(page) {
+    await page.getByRole("navigation", { name: "Principal", exact: true }).getByRole("button", { name: "Mis archivos", exact: true }).click();
+    await page.getByRole("button", { name: "Nueva carpeta", exact: true }).click();
+    await page.getByRole("textbox", { name: "Nombre", exact: true }).fill("Destino QA");
+    await page.getByRole("button", { name: "Crear carpeta", exact: true }).click();
+    await expect(page.locator(".folder-card")).toHaveCount(1);
+  }
+  await test("drag-card-body-multiple-files", async page => {
+    await makeDropFolder(page);
+    await page.locator(".file-card strong").nth(0).click();
+    await page.locator(".file-card strong").nth(1).click();
+    await expect(page.locator(".file-card.selected")).toHaveCount(2);
+    await page.locator(".file-card .file-meta").first().dragTo(page.locator(".folder-card"));
+    await expect(page.locator(".file-card")).toHaveCount(14);
+    const move = await page.evaluate(() => window.__qa.calls.filter(c => c.cmd === "move_files_to_folder"));
+    assert.deepEqual(move.map(c => c.args), [{ ids: ["file-0", "file-1"], folderId: "folder-0" }]);
+  });
+  async function touchDrag(page, points, hold = 0) {
+    const cdp = await page.context().newCDPSession(page);
+    const touch = (type, point) => cdp.send("Input.dispatchTouchEvent", { type, touchPoints: point ? [{ x: point.x, y: point.y, radiusX: 3, radiusY: 3, force: 1, id: 1 }] : [] });
+    await touch("touchStart", points[0]);
+    if (hold) await new Promise(resolve => setTimeout(resolve, hold));
+    for (const point of points.slice(1)) await touch("touchMove", point);
+    await touch("touchEnd");
+    await cdp.detach();
+  }
+  for (const cancel of [false, true]) await test(`touch-card-body-${cancel ? "cancel-outside" : "move"}`, async page => {
+    await page.getByRole("button", { name: "Abrir menú", exact: true }).click();
+    await makeDropFolder(page);
+    const name = page.locator(".file-card strong").first();
+    await name.tap();
+    await expect(page.locator(".file-card.selected")).toHaveCount(1);
+    const from = await name.boundingBox();
+    const to = await page.locator(".folder-card").boundingBox();
+    const a = { x: from.x + from.width / 2, y: from.y + from.height / 2 };
+    const b = { x: to.x + to.width / 2, y: to.y + to.height / 2 };
+    const points = [a, ...Array.from({ length: 8 }, (_, i) => ({ x: a.x + (b.x - a.x) * (i + 1) / 8, y: a.y + (b.y - a.y) * (i + 1) / 8 }))];
+    if (cancel) points.push({ x: 4, y: 4 });
+    await touchDrag(page, points);
+    if (cancel) {
+      await expect(page.locator(".touch-drag-badge")).toHaveCount(0);
+      assert.equal(await page.evaluate(() => window.__qa.calls.filter(c => c.cmd === "move_files_to_folder").length), 0);
+    } else await expect(page.locator(".file-card")).toHaveCount(15);
+  }, { width: 412, height: 915 });
+  await test("preloaded-image-and-text-thumbnails", async page => {
+    await page.route("**/qa-media/thumb.txt", route => route.fulfill({ contentType: "text/plain", body: "Documento de ejemplo\nContenido visible antes de abrirlo" }));
+    await page.evaluate(() => {
+      const qa = window.__qa;
+      const fixture = document.createElement("canvas");
+      fixture.width = 80; fixture.height = 60;
+      const ctx = fixture.getContext("2d"); ctx.fillStyle = "#6476e8"; ctx.fillRect(0, 0, 80, 60);
+      qa.thumbnails = {
+        "file-0": { kind: "image", path: null, dataUrl: fixture.toDataURL() },
+        "file-1": { kind: "text", path: "thumb.txt", dataUrl: null },
+      };
+      qa.files[0].updatedAt = "2026-09-10T10:00:00Z";
+      qa.files[1].updatedAt = "2026-09-10T09:00:00Z";
+    });
+    await expect(page.locator(".file-thumbnail img")).toHaveCount(1, { timeout: 15000 });
+    await expect(page.locator(".file-thumbnail pre")).toContainText("Contenido visible antes de abrirlo");
+    assert.equal(await page.evaluate(() => window.__qa.calls.filter(c => c.cmd === "prepare_media").length), 0);
+    await page.screenshot({ path: path.join(output, "thumbnails-current.png"), fullPage: true });
+  });
+  await test("large-text-preview-does-not-download", async page => {
+    await page.evaluate(() => { window.__qa.files[0].kind = "text"; window.__qa.files[0].sizeBytes = 4 * 1024 * 1024; });
+    await expect(page.locator(".file-card").first()).toContainText("4.00 MB");
+    await page.locator(".file-card").first().getByTitle("Vista previa", { exact: true }).click();
+    await expect(page.getByRole("dialog")).toContainText("limitada a 2 MB");
+    assert.equal(await page.evaluate(() => window.__qa.calls.filter(c => c.cmd === "prepare_media").length), 0);
+  });
   await test("selection-after-sort", async page => {
     await page.getByRole("checkbox", { name: "Seleccionar Archivo 00 con nombre largo", exact: true }).check();
     await page.getByRole("combobox", { name: "Ordenar" }).selectOption("oldest");

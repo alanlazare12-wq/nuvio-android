@@ -505,3 +505,15 @@ kbd { border: 1px solid var(--border); background: var(--panel); border-radius: 
 }
 
 .empty-state .secondary-button { margin-top: 8px; }
+
+/* Select anywhere, then drag from the complete card or row on touch screens. */
+.file-card.selected, .file-row.selected { touch-action: none; }
+.file-card, .file-row { -webkit-touch-callout: none; }
+.file-card:focus-visible, .file-row:focus-visible { outline: 2px solid var(--accent, #6366f1); outline-offset: 3px; }
+.file-thumbnail { display: flex; align-items: center; justify-content: center; width: 100%; height: 100%; overflow: hidden; pointer-events: none; }
+.file-thumbnail img { width: 100%; height: 100%; object-fit: contain; user-select: none; }
+.file-thumbnail pre { background: #fff; color: #334155; width: 100%; height: 100%; padding: 14px 18px; margin: 0; font: 8px/1.5 monospace; white-space: pre-wrap; overflow: hidden; text-align: left; }
+.file-preview > .file-thumbnail { position: absolute; inset: 0; }
+.file-preview .file-select-checkbox, .file-preview .favorite-button, .file-preview .file-extension { z-index: 1; }
+.file-thumbnail.is-ready { background: rgba(255,255,255,.45); }
+.small-file-icon .file-thumbnail pre { padding: 2px; font-size: 3px; }

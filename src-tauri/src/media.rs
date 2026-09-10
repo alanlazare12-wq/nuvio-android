@@ -19,7 +19,90 @@ pub struct MediaReady {
     pub from_cache: bool,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThumbnailSource {
+    pub kind: String,
+    pub path: Option<String>,
+    pub data_url: Option<String>,
+}
+
 impl TelegramService {
+    pub async fn prepare_thumbnail(
+        &self,
+        repo: &CatalogRepository,
+        file_id: &str,
+        cache_dir: &Path,
+        cache_limit: i64,
+    ) -> Result<Option<ThumbnailSource>, String> {
+        let doc = repo.remote(file_id)?;
+        let chat = self.own_chat(repo).await?;
+        let e::Message::Message(message) =
+            call(f::get_message(chat, doc.message_id, self.client_id)).await?;
+        let e::MessageContent::MessageDocument(content) = message.content else {
+            return Ok(None);
+        };
+        // Telegram's tiny JPEG is already in the message: no original download is needed.
+        if let Some(mini) = content
+            .document
+            .minithumbnail
+            .filter(|mini| mini.data.len() <= 64 * 1024)
+        {
+            return Ok(Some(ThumbnailSource {
+                kind: "image".into(),
+                path: None,
+                data_url: Some(format!("data:image/jpeg;base64,{}", mini.data)),
+            }));
+        }
+        if let Some(thumb) = content
+            .document
+            .thumbnail
+            .filter(|thumb| thumb.file.size > 0 && thumb.file.size <= 1024 * 1024)
+        {
+            let e::File::File(file) = call(f::download_file(
+                thumb.file.id,
+                1,
+                0,
+                0,
+                true,
+                self.client_id,
+            ))
+            .await?;
+            if file.local.is_downloading_completed {
+                let source = Path::new(&file.local.path);
+                let size = fs::metadata(source).map_err(|e| e.to_string())?.len();
+                if size > 0 && size <= 1024 * 1024 {
+                    fs::create_dir_all(cache_dir).map_err(|e| e.to_string())?;
+                    let target = cache_dir.join(format!("{}.thumb.jpg", sanitize_id(file_id)));
+                    let hash = sha256_file(source).map_err(|e| e.to_string())?;
+                    copy_media(source, &target, &hash, size as i64)?;
+                    clean_cache(cache_dir, cache_limit, Some(&target))?;
+                    return Ok(Some(ThumbnailSource {
+                        kind: "image".into(),
+                        path: Some(target.to_string_lossy().into_owned()),
+                        data_url: None,
+                    }));
+                }
+            }
+        }
+        let extension = Path::new(&doc.name)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let Some(kind) = original_thumbnail_kind(&extension, doc.size) else {
+            return Ok(None);
+        };
+        let ready = self
+            .prepare_media(repo, file_id, cache_dir, cache_limit)
+            .await?;
+        Ok(Some(ThumbnailSource {
+            kind: kind.into(),
+            path: Some(ready.path),
+            data_url: None,
+        }))
+    }
+
     pub async fn prepare_media(
         &self,
         repo: &CatalogRepository,
@@ -108,6 +191,35 @@ impl TelegramService {
         }
         Err("La preparación de la vista previa tardó demasiado".into())
     }
+}
+
+fn original_thumbnail_kind(extension: &str, size: i64) -> Option<&'static str> {
+    if !(1..=8 * 1024 * 1024).contains(&size) {
+        return None;
+    }
+    match extension {
+        "jpg" | "jpeg" | "png" | "webp" | "gif" => Some("image"),
+        "pdf" => Some("pdf"),
+        "txt" | "md" | "json" | "csv" | "rs" | "js" | "ts" | "css" | "html" | "py" | "xml"
+        | "yaml" | "yml"
+            if size <= 256 * 1024 =>
+        {
+            Some("text")
+        }
+        _ => None,
+    }
+}
+
+#[test]
+fn thumbnails_never_download_large_or_unsupported_originals() {
+    assert_eq!(
+        original_thumbnail_kind("jpg", 8 * 1024 * 1024),
+        Some("image")
+    );
+    assert_eq!(original_thumbnail_kind("jpg", 8 * 1024 * 1024 + 1), None);
+    assert_eq!(original_thumbnail_kind("mp4", 1024), None);
+    assert_eq!(original_thumbnail_kind("pdf", -1), None);
+    assert_eq!(original_thumbnail_kind("txt", 256 * 1024 + 1), None);
 }
 
 fn copy_media(source: &Path, target: &Path, hash: &str, size: i64) -> Result<bool, String> {
