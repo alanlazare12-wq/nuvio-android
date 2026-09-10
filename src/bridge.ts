@@ -146,6 +146,9 @@ export async function downloadFile(file: CloudFile): Promise<boolean> {
 }
 
 export async function selectFilesForUpload(): Promise<string[]> {
+  if ((await invoke<string>("platform_name")) === "android") {
+    return invoke<string[]>("pick_upload_files");
+  }
   const selected = await open({
     multiple: true,
     directory: false,

@@ -99,3 +99,46 @@ pub fn background() -> Result<(), String> {
     }
     Ok(())
 }
+
+#[cfg(target_os = "android")]
+pub async fn pick_upload_files() -> Result<Vec<String>, String> {
+    #[derive(Deserialize)]
+    struct Response {
+        paths: Vec<String>,
+    }
+    let result: Response = HANDLE
+        .get()
+        .ok_or("Android aún no está listo")?
+        .run_mobile_plugin_async("pickUploadFiles", serde_json::json!({}))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(result.paths)
+}
+
+#[cfg(target_os = "android")]
+pub async fn stage_content_uri(uri: &str) -> Result<String, String> {
+    #[derive(Deserialize)]
+    struct Response {
+        path: String,
+    }
+    let result: Response = HANDLE
+        .get()
+        .ok_or("Android aún no está listo")?
+        .run_mobile_plugin_async("stageContentUri", serde_json::json!({"uri": uri}))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(result.path)
+}
+
+#[allow(dead_code)]
+#[cfg(not(target_os = "android"))]
+pub async fn pick_upload_files() -> Result<Vec<String>, String> {
+    Ok(Vec::new())
+}
+
+#[allow(dead_code)]
+#[cfg(not(target_os = "android"))]
+pub async fn stage_content_uri(_uri: &str) -> Result<String, String> {
+    Err("Los URI de Android sólo están soportados en Android".into())
+}
+

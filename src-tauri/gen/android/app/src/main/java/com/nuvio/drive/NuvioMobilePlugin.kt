@@ -4,9 +4,11 @@ import android.app.Activity
 import android.content.Intent
 import android.net.Uri
 import android.provider.DocumentsContract
+import android.provider.OpenableColumns
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import androidx.activity.result.ActivityResult
+import java.util.UUID
 import app.tauri.annotation.ActivityCallback
 import app.tauri.annotation.Command
 import app.tauri.annotation.InvokeArg
@@ -95,6 +97,85 @@ class NuvioMobilePlugin(private val host: Activity) : Plugin(host) {
             host.contentResolver.takePersistableUriPermission(uri, flags)
             invoke.resolve(JSObject().apply { put("uri", uri.toString()) })
         } catch (error: Exception) { invoke.reject(error.message ?: "No se pudo abrir la carpeta") }
+    }
+
+    private fun stageContentUriInternal(uri: Uri): String {
+        var displayName = "archivo"
+        try {
+            host.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (nameIdx >= 0) {
+                        cursor.getString(nameIdx)?.let { displayName = it }
+                    }
+                }
+            }
+        } catch (_: Exception) {}
+
+        displayName = displayName.replace('/', '_').replace('\\', '_').trim()
+        if (displayName.isBlank() || displayName == "." || displayName == "..") {
+            displayName = "archivo"
+        }
+
+        val stagingFolder = File(host.cacheDir, "upload_staging").apply { mkdirs() }
+        val uniqueFolder = File(stagingFolder, "${System.currentTimeMillis()}_${UUID.randomUUID().toString().take(8)}").apply { mkdirs() }
+        val targetFile = File(uniqueFolder, displayName)
+
+        host.contentResolver.openInputStream(uri)?.use { input ->
+            targetFile.outputStream().use { output ->
+                input.copyTo(output, 1024 * 1024)
+            }
+        } ?: error("Android no pudo abrir el archivo seleccionado")
+
+        return targetFile.canonicalPath
+    }
+
+    @Command fun pickUploadFiles(invoke: Invoke) {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "*/*"
+            putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+        }
+        startActivityForResult(invoke, intent, "uploadFilesPicked")
+    }
+
+    @ActivityCallback fun uploadFilesPicked(invoke: Invoke, result: ActivityResult) {
+        try {
+            if (result.resultCode != Activity.RESULT_OK || result.data == null) {
+                invoke.resolve(JSObject().apply { put("paths", JSONArray()) })
+                return
+            }
+            val uris = mutableListOf<Uri>()
+            val data = result.data!!
+            if (data.clipData != null) {
+                for (i in 0 until data.clipData!!.itemCount) {
+                    uris.add(data.clipData!!.getItemAt(i).uri)
+                }
+            } else if (data.data != null) {
+                uris.add(data.data!!)
+            }
+            if (uris.isEmpty()) {
+                invoke.resolve(JSObject().apply { put("paths", JSONArray()) })
+                return
+            }
+            io.execute {
+                try {
+                    val paths = uris.map { uri -> stageContentUriInternal(uri) }
+                    invoke.resolve(JSObject().apply { put("paths", JSONArray(paths)) })
+                } catch (e: Exception) {
+                    invoke.reject(e.message ?: "Error al procesar archivos seleccionados")
+                }
+            }
+        } catch (error: Exception) {
+            invoke.reject(error.message ?: "No se pudieron seleccionar los archivos")
+        }
+    }
+
+    @Command fun stageContentUri(invoke: Invoke) = work(invoke) {
+        val args = invoke.parseArgs(UriArgs::class.java)
+        val uri = Uri.parse(args.uri)
+        val path = stageContentUriInternal(uri)
+        JSObject().apply { put("path", path) }
     }
 
     private fun tree(raw: String): Uri {

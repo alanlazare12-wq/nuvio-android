@@ -125,11 +125,15 @@ fn set_favorite(
 #[tauri::command]
 async fn prepare_upload(
     state: State<'_, Arc<AppState>>,
-    path: String,
+    #[allow(unused_mut)] mut path: String,
     encrypt: bool,
     passphrase: Option<String>,
     folder_id: Option<String>,
 ) -> Result<PreparedUpload, String> {
+    #[cfg(target_os = "android")]
+    if path.starts_with("content://") {
+        path = mobile::stage_content_uri(&path).await?;
+    }
     let state = state.inner().clone();
     if let Some(folder) = folder_id.as_deref() {
         let target = state
@@ -293,6 +297,11 @@ async fn pick_download_directory() -> Result<Option<String>, String> {
     return mobile::pick_directory().await;
     #[cfg(not(target_os = "android"))]
     Ok(None)
+}
+
+#[tauri::command]
+async fn pick_upload_files() -> Result<Vec<String>, String> {
+    mobile::pick_upload_files().await
 }
 
 #[tauri::command]
@@ -969,6 +978,7 @@ pub fn run() {
             get_dashboard,
             set_favorite,
             prepare_upload,
+            pick_upload_files,
             decrypt_nuvio_file,
             sync_files,
             create_folder,
