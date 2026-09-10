@@ -2,6 +2,18 @@
 
 Cliente de nube privada con React, TypeScript y Tauri. Usa Mensajes guardados de Telegram como almacenamiento remoto y SQLite para el catálogo local.
 
+La versión actual es **1.1.0**. Windows y Android comparten este repositorio y la rama principal es **`master`**. Los cambios de cada versión se describen en [CHANGELOG.md](CHANGELOG.md).
+
+**Selección, movimiento y miniaturas**
+
+Haz clic o toca una zona libre de la tarjeta para seleccionarla. Puedes seleccionar varios archivos y arrastrarlos desde el nombre, la miniatura o sus metadatos hasta una carpeta o la ruta Mi unidad. En pantallas táctiles, selecciona primero y después arrastra la tarjeta; acercarte a los bordes desplaza la lista. Soltar fuera de un destino cancela el movimiento. El botón Mover a carpeta también permite elegir destinos que no están visibles.
+
+Las miniaturas se preparan automáticamente alrededor del área visible y conservan el icono del tipo de archivo cuando el formato no tiene vista previa o la red no está disponible. Se procesan dos a la vez. Nuvio usa las miniaturas de Telegram cuando existen y limita la descarga anticipada de originales a imágenes/PDF de 8 MB y textos de 256 KB.
+
+**Guardar próximas versiones en GitHub Desktop**
+
+Abre este repositorio, trabaja en `master`, revisa los archivos en Changes, escribe el resumen del cambio y usa Commit to master. Después usa Push origin para subir esos commits. Cambia la versión en `package.json`, `src-tauri/Cargo.toml` y `src-tauri/tauri.conf.json` antes de generar una nueva distribución; la compilación actualiza `Cargo.lock`. Conserva los instaladores fuera del historial Git y publica archivos de distribución por separado si necesitas compartirlos.
+
 **Desarrollo**
 
 ```powershell

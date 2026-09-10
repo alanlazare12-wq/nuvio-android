@@ -1,6 +1,6 @@
-# Nuvio 1.0.0 — verificación de distribución
+# Nuvio 1.1.0 — verificación de distribución
 
-Revisión iniciada el 9 de septiembre de 2026, después de incorporar los cambios de carpetas, movimientos, historial y vistas previas del usuario.
+Revisión del 9–10 de septiembre de 2026, incorporando los cambios del usuario y las mejoras de arrastre y precarga. Rama principal: `master`.
 
 ## Correcciones relevantes
 
@@ -20,50 +20,53 @@ Revisión iniciada el 9 de septiembre de 2026, después de incorporar los cambio
 
 | Comprobación | Resultado | Evidencia |
 | --- | --- | --- |
-| Rust, reglas de catálogo, transferencias, integridad y carpetas | 37 aprobadas, 0 fallos | `rust-tests.log` |
-| Clippy con advertencias tratadas como errores | Aprobado | `clippy.log` |
-| Interfaz real con IPC simulado | 13 aprobadas, 0 fallos | `ui-tests.log`, `ui-results.json` |
+| Rust, reglas de catálogo, transferencias, integridad y carpetas | 38 aprobadas, 0 fallos | `rust-tests-current.log` |
+| Clippy con advertencias tratadas como errores | Aprobado | `clippy-current.log` |
+| Interfaz real con IPC simulado | 18 aprobadas, 0 fallos | `ui-current.log`, `ui-results.json` |
 | PDF real y trabajador de PDF.js en pantalla móvil | Aprobado, límite de memoria verificado | `ui-results.json` |
 | TypeScript y compilación de producción de la interfaz | Aprobado | Registros de empaquetado |
 
 Las pruebas de interfaz cubren carpetas, selección, papelera, favoritos, tema, diálogos, errores, vistas previas y anchos de 390, 768 y 1280 píxeles. Las respuestas de Telegram se simulan en esas pruebas; no son una prueba de transferencia real.
 
-## Verificación de instaladores
+## Mejoras de 1.1.0 comprobadas
 
-- **Windows 11 de 64 bits (`release/Windows/Nuvio-Setup-Windows11-x64.exe`):**
-  - Empaquetado completo NSIS completado con WebView2 y 15 bibliotecas DLL incluidas (TDLib, OpenSSL, C++ CRT).
-  - Verificado en instalación autónoma (`qa/windows-install/nuviodrive-v1.exe`): arranca y opera de forma independiente con los servidores de desarrollo apagados.
-  - Incorporación de buscador rápido por nombre de archivo en la barra de herramientas y sincronizado con la barra superior.
-  - Corrección de Drag & Drop (arrastrar y soltar) entre tarjetas de archivos y carpetas:
-    - Desactivado el interceptor OLE nativo de WebView2 (`dragDropEnabled: false` en `tauri.conf.json`) que bloqueaba los eventos estándar de HTML5 DOM en Windows.
-    - Soporte CSS con `-webkit-user-drag: element` y bloqueo de selección de texto (`user-select: none`) en tarjetas y filas para evitar que el puntero seleccione texto al arrastrar.
-    - Manejo de `pointer-events: none` en hijos de carpetas y filtrado de `event.relatedTarget` para evitar cancelaciones prematuras (`dragleave`) y efecto de prohibición (cursor 🚫).
+- Ratón: selección desde el cuerpo de la tarjeta y movimiento de varios archivos. `pointercancel` del arrastre HTML ya no borra el estado del movimiento.
+- Pantalla táctil: selección por toque y arrastre desde toda la tarjeta. Las pruebas envían gestos táctiles mediante Chromium, no eventos DOM simulados. Soltar fuera del destino cancela sin mover archivos.
+- Miniaturas: imágenes y texto precargados antes de abrir el visor, con fallback de iconos. Las originales se limitan en Rust a 8 MB para imágenes/PDF y 256 KB para texto; no se descargan originales de video para la cuadrícula.
+- Visor de texto: el límite de 2 MB se comprueba antes de llamar a la preparación/descarga nativa.
+- Interfaz revisada a 390, 768 y 1280 píxeles; PDF real procesado con el trabajador de PDF.js.
+- Graphify actualizado mediante AST: 685 nodos y 1766 relaciones; el mapa inicial era anterior a los cambios del usuario.
 
-- **Samsung Galaxy S24 Ultra / Android ARM64 (`release/Android/Nuvio-Android-aarch64.apk`):**
-  - Binarios ELF (`libnuviodrive_v1_lib.so` y `libtdjson.so`) verificados para arquitectura AArch64, enlazado dinámico con `libc.so` del sistema y soporte de páginas de 16 KB.
-  - Firma persistente validada con `apksigner` y alineación validada con `zipalign -c -P 16 -v 4`.
-  - Corrección completa de arrastre táctil hacia carpetas (Drag & Drop en Android):
-    - Desactivado `draggable={false}` en dispositivos táctiles/móviles para evitar que Chromium lance el arrastre nativo del sistema operativo (que generaba una sombra semitransparente inerte, cancelaba los eventos web y reportaba "Movimiento cancelado.").
-    - Implementación de detección geométrica de carpetas de destino con fallback por rectángulos (`getBoundingClientRect`), asegurando que siempre se detecte la carpeta objetivo al soltar el dedo.
-    - Almacenamiento y recuperación de coordenadas y último objetivo sobrevolado (`lastTarget`), permitiendo soltar sobre la carpeta sin falsos positivos de cancelación.
-    - Retroalimentación háptica (vibración al tomar y soltar) e insignia dinámica que muestra en tiempo real "Mover a [carpeta]".
-  - Botón de sincronización con Telegram restaurado en la cabecera móvil (40×40 con icono `RefreshCw` y animación de rotación durante la sincronización).
-  - Buscador rápido por nombre integrado en la cabecera de la lista de archivos con borrado instantáneo (botón X) y filtrado inmediato en tiempo real.
-  - Verificado visualmente en emulador Android API 36 con 16 KB pages.
-  - Pruebas nativas de integración superadas con éxito en emulador de 16 KB (`NativeStorageInstrumentation`):
-    - Ciclo de cifrado y descifrado seguro de sesión con Android Keystore y detección de alteraciones.
-    - Selector de carpetas del sistema con permisos persistentes (SAF).
-    - Copia, cálculo y verificación de descargas con SHA-256.
-    - Políticas de conflicto de nombres (`skip` y `rename`).
-    - Detección y rechazo de archivos fuente corruptos o incompletos.
-    - Exportación de diagnósticos al sistema de archivos.
+## Verificación de instaladores 1.1.0
 
+| Paquete | Resultado |
+| --- | --- |
+| Windows 11 x64, NSIS 1.1.0 | Compilación, instalación silenciosa y apertura de la aplicación aprobadas. |
+| Contenido instalado de Windows | 15 DLL idénticas por SHA-256; ejecutable idéntico salvo el marcador documentado de Tauri `UNK -> NSS`; incluye `index-De7XTSkx.js`, la última interfaz. |
+| Android ARM64 1.1.0, código 1001000 | Firma v2 válida, certificado persistente y APK de producción no depurable. Android mínimo 26, objetivo 36. |
+| ELF y alineación Android | AArch64, dependencia dinámica de libc.so, segmentos de 16 KB y zipalign de 16 KB aprobados para las dos bibliotecas. |
+| Instalación Android | Aprobada. El SHA-256 del APK extraído del emulador coincide con el archivo entregado. |
+| Arranque normal Android | Aprobado, inicio en frío en 1778 ms; interfaz inspeccionada visualmente y sin errores fatales del proceso en logcat. |
+| Almacenamiento nativo Android | `NUVIO_NATIVE_TESTS_PASSED` sobre el APK firmado y minificado de distribución. |
+
+La prueba nativa cubre Keystore (cifrado/descifrado y alteraciones), selección SAF y permiso persistente, publicación y relectura con SHA-256, omisión de duplicados, renombrado, rechazo de fuente corrupta, listado y exportación de diagnóstico. Usa únicamente archivos temporales en `Download/Nuvio-QA` y elimina sus propios archivos al finalizar.
+
+Windows se abrió desde `qa/windows-install-1.1.0/nuviodrive-v1.exe` con el puerto de desarrollo 1420 sin servidor escuchando. Conservó la sesión y el catálogo existentes. La prueba visual no modificó archivos del usuario.
+
+Evidencias locales: `windows-final-build.log`, `windows-install-verification.json`, `android-final-build.log`, `android-signature.log`, `android-alignment.log`, `android-elf.log`, `android-manifest.log`, `android-native-final.log`, `android-final-startup.log` y `android-release-1.1.0.png`. Los registros y capturas con datos del equipo se excluyen del repositorio.
+
+### Identificación de los entregables
+
+| Archivo | Bytes | SHA-256 |
+| --- | ---: | --- |
+| Nuvio-Setup-Windows11-x64.exe | 277242589 | `36c51bf959acecd952cd249e007992fc3582d9f3a5ac6faacd6cb92500fe0a57` |
+| Nuvio-Android-aarch64.apk | 57081583 | `85e2f0349e38e49f6acb7bb43ed67e4d12fbcea260ea7d922358a11e97ee31da` |
 
 ## Alcance y límites
 
 - Equipo Android disponible: emulador Android 16, API 36, páginas de 16384 bytes, ABI x86_64 con traducción ARM64. La pantalla de QA está configurada a 1440 × 3120.
 - No hay un Galaxy S24 Ultra físico conectado durante esta revisión. La arquitectura del APK es la adecuada para ese teléfono; una prueba en el emulador no sustituye la comprobación en One UI y el hardware real.
-- Las pruebas de almacenamiento nativo usan archivos temporales de QA, sin cuenta de Telegram. La sesión, sincronización y transferencia real en Android requieren iniciar sesión en ese dispositivo.
+- El programa de pruebas de almacenamiento nativo usa archivos temporales de QA, sin cuenta de Telegram. La sesión, sincronización y transferencia real en Android requieren iniciar sesión en ese dispositivo.
 - La firma del APK es una firma de distribución local persistente. El setup Windows no cuenta con certificado Authenticode de editor.
 - El cifrado adicional de archivos para subir a Telegram sigue deshabilitado en las dos aplicaciones.
-- Los instaladores finales se identificarán por SHA-256 en `release/SHA256SUMS.txt`.
+- Los instaladores se identifican por SHA-256 en `release/SHA256SUMS.txt`. La verificación se aplica a esos archivos exactos. Los instaladores y las claves de firma quedan fuera del historial Git.
