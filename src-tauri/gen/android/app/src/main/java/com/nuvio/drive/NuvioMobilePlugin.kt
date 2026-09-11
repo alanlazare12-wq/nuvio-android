@@ -1,13 +1,23 @@
 package com.nuvio.drive
 
 import android.app.Activity
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
+import android.Manifest
 import androidx.activity.result.ActivityResult
+import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
+import androidx.core.content.ContextCompat
 import java.util.UUID
 import app.tauri.annotation.ActivityCallback
 import app.tauri.annotation.Command
@@ -32,6 +42,29 @@ import javax.crypto.spec.GCMParameterSpec
 @InvokeArg class PublishArgs {
     lateinit var source: String; lateinit var uri: String; lateinit var name: String
     lateinit var policy: String; lateinit var sha256: String; var size: Long = 0
+}
+@InvokeArg class SyncNotificationArgs {
+    var active: Boolean = false
+    var percent: Int? = null
+    var scanned: Int = 0
+    var total: Int? = null
+    var phase: String? = null
+    var error: String? = null
+}
+@InvokeArg class UploadNotificationArgs {
+    var active: Boolean = false
+    var total: Int = 0
+    var completed: Int = 0
+    var pending: Int = 0
+    var failed: Int = 0
+    var percent: Int? = null
+    var processedBytes: Long = 0L
+    var totalBytes: Long = 0L
+    var speedBps: Long = 0L
+    var currentFileName: String? = null
+}
+@InvokeArg class IdArgs {
+    var id: Int = 0
 }
 
 @TauriPlugin
@@ -352,5 +385,181 @@ class NuvioMobilePlugin(private val host: Activity) : Plugin(host) {
         host.contentResolver.openOutputStream(uri, "wt")?.use { it.write(decode(args.data)); it.flush() }
             ?: error("No se pudo guardar el diagnóstico")
         JSObject()
+    }
+
+    private val CHANNEL_ID = "nuvio_status_channel"
+    private val SYNC_NOTIFICATION_ID = 1001
+    private val UPLOAD_NOTIFICATION_ID = 1002
+
+    init {
+        createNotificationChannel()
+    }
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val name = "Estado y transferencias de Nuvio"
+            val descriptionText = "Progreso de sincronización y transferencias en segundo plano"
+            val importance = NotificationManager.IMPORTANCE_LOW
+            val channel = NotificationChannel(CHANNEL_ID, name, importance).apply {
+                description = descriptionText
+                setShowBadge(false)
+            }
+            val notificationManager = host.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+            notificationManager?.createNotificationChannel(channel)
+        }
+    }
+
+    private fun canPostNotifications(): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            ContextCompat.checkSelfPermission(host, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+        } else {
+            NotificationManagerCompat.from(host).areNotificationsEnabled()
+        }
+    }
+
+    private fun getLaunchPendingIntent(): PendingIntent? {
+        val launchIntent = host.packageManager.getLaunchIntentForPackage(host.packageName)?.apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        } ?: return null
+        return PendingIntent.getActivity(
+            host,
+            0,
+            launchIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+    }
+
+    private fun formatSize(bytes: Long): String {
+        if (bytes <= 0) return "0 B"
+        val units = arrayOf("B", "KB", "MB", "GB", "TB")
+        val digitGroups = (Math.log10(bytes.toDouble()) / Math.log10(1024.0)).toInt().coerceIn(0, units.size - 1)
+        return "%.1f %s".format(bytes / Math.pow(1024.0, digitGroups.toDouble()), units[digitGroups])
+    }
+
+    @Command fun updateSyncNotification(invoke: Invoke) {
+        if (!canPostNotifications()) {
+            invoke.resolve(JSObject().apply { put("posted", false) })
+            return
+        }
+        try {
+            val args = invoke.parseArgs(SyncNotificationArgs::class.java)
+            val notificationManager = NotificationManagerCompat.from(host)
+            val launchPendingIntent = getLaunchPendingIntent()
+
+            val builder = NotificationCompat.Builder(host, CHANNEL_ID)
+                .setSmallIcon(android.R.drawable.stat_notify_sync)
+                .setContentIntent(launchPendingIntent)
+                .setOnlyAlertOnce(true)
+                .setPriority(NotificationCompat.PRIORITY_LOW)
+
+            if (args.active) {
+                val title = if (args.phase == "applying") "Actualizando catálogo…" else "Sincronizando con Telegram…"
+                val contentText = if (args.percent != null) {
+                    "${args.percent}% aprox. · ${args.scanned} mensajes revisados"
+                } else {
+                    "${args.scanned} mensajes revisados…"
+                }
+                builder.setContentTitle(title)
+                    .setContentText(contentText)
+                    .setOngoing(true)
+                    .setAutoCancel(false)
+                    .setCategory(NotificationCompat.CATEGORY_PROGRESS)
+
+                if (args.percent != null) {
+                    builder.setProgress(100, args.percent!!.coerceIn(0, 100), false)
+                } else {
+                    builder.setProgress(100, 0, true)
+                }
+            } else {
+                builder.setOngoing(false)
+                    .setAutoCancel(true)
+                    .setProgress(0, 0, false)
+
+                if (!args.error.isNullOrBlank()) {
+                    builder.setContentTitle("Sincronización interrumpida")
+                        .setContentText(args.error)
+                } else {
+                    builder.setContentTitle("Sincronización completada")
+                        .setContentText("${args.scanned} mensajes revisados · Catálogo al día")
+                }
+            }
+
+            notificationManager.notify(SYNC_NOTIFICATION_ID, builder.build())
+            invoke.resolve(JSObject().apply { put("posted", true) })
+        } catch (e: Exception) {
+            invoke.reject(e.message ?: "Error al actualizar notificación de sincronización")
+        }
+    }
+
+    @Command fun updateUploadNotification(invoke: Invoke) {
+        if (!canPostNotifications()) {
+            invoke.resolve(JSObject().apply { put("posted", false) })
+            return
+        }
+        try {
+            val args = invoke.parseArgs(UploadNotificationArgs::class.java)
+            val notificationManager = NotificationManagerCompat.from(host)
+            val launchPendingIntent = getLaunchPendingIntent()
+
+            val builder = NotificationCompat.Builder(host, CHANNEL_ID)
+                .setSmallIcon(android.R.drawable.stat_sys_upload)
+                .setContentIntent(launchPendingIntent)
+                .setOnlyAlertOnce(true)
+                .setPriority(NotificationCompat.PRIORITY_LOW)
+
+            if (args.active) {
+                val title = if (!args.currentFileName.isNullOrBlank()) {
+                    "Subiendo: ${args.currentFileName}"
+                } else {
+                    "Subiendo archivos a Telegram…"
+                }
+
+                val speedText = if (args.speedBps > 0) " · ${formatSize(args.speedBps)}/s" else ""
+                val sizeText = if (args.totalBytes > 0) " · ${formatSize(args.processedBytes)} de ${formatSize(args.totalBytes)}" else ""
+                val contentText = "${args.completed} de ${args.total} completados$sizeText$speedText"
+
+                builder.setContentTitle(title)
+                    .setContentText(contentText)
+                    .setOngoing(true)
+                    .setAutoCancel(false)
+                    .setCategory(NotificationCompat.CATEGORY_PROGRESS)
+
+                val pct = args.percent ?: if (args.totalBytes > 0) {
+                    ((args.processedBytes.toDouble() / args.totalBytes.toDouble()) * 100).toInt().coerceIn(0, 100)
+                } else if (args.total > 0) {
+                    ((args.completed.toDouble() / args.total.toDouble()) * 100).toInt().coerceIn(0, 100)
+                } else 0
+
+                builder.setProgress(100, pct, false)
+            } else {
+                builder.setOngoing(false)
+                    .setAutoCancel(true)
+                    .setProgress(0, 0, false)
+
+                if (args.failed > 0) {
+                    builder.setContentTitle("Subidas finalizadas con errores")
+                        .setContentText("${args.completed} subidos correctamente · ${args.failed} con error")
+                } else {
+                    builder.setContentTitle("Subidas completadas")
+                        .setContentText("${args.total} archivos subidos correctamente a Telegram")
+                }
+            }
+
+            notificationManager.notify(UPLOAD_NOTIFICATION_ID, builder.build())
+            invoke.resolve(JSObject().apply { put("posted", true) })
+        } catch (e: Exception) {
+            invoke.reject(e.message ?: "Error al actualizar notificación de subida")
+        }
+    }
+
+    @Command fun clearNotification(invoke: Invoke) {
+        try {
+            val args = invoke.parseArgs(IdArgs::class.java)
+            val notificationManager = NotificationManagerCompat.from(host)
+            notificationManager.cancel(args.id)
+            invoke.resolve(JSObject())
+        } catch (e: Exception) {
+            invoke.reject(e.message ?: "Error al limpiar notificación")
+        }
     }
 }
