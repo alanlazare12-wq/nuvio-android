@@ -160,7 +160,12 @@ class NuvioMobilePlugin(private val host: Activity) : Plugin(host) {
             }
             io.execute {
                 try {
-                    val paths = uris.map { uri -> stageContentUriInternal(uri) }
+                    val paths = mutableListOf<String>()
+                    for (uri in uris) {
+                        try {
+                            paths.add(stageContentUriInternal(uri))
+                        } catch (_: Exception) {}
+                    }
                     invoke.resolve(JSObject().apply { put("paths", JSONArray(paths)) })
                 } catch (e: Exception) {
                     invoke.reject(e.message ?: "Error al procesar archivos seleccionados")
@@ -168,6 +173,104 @@ class NuvioMobilePlugin(private val host: Activity) : Plugin(host) {
             }
         } catch (error: Exception) {
             invoke.reject(error.message ?: "No se pudieron seleccionar los archivos")
+        }
+    }
+
+    @Command fun pickUploadDirectory(invoke: Invoke) {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).addFlags(
+            Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PREFIX_URI_PERMISSION
+        )
+        startActivityForResult(invoke, intent, "uploadDirectoryPicked")
+    }
+
+    @ActivityCallback fun uploadDirectoryPicked(invoke: Invoke, result: ActivityResult) {
+        try {
+            val treeUri = result.data?.data
+            if (result.resultCode != Activity.RESULT_OK || treeUri == null) {
+                invoke.resolve(JSObject().apply { put("cancelled", true) })
+                return
+            }
+            val flags = result.data!!.flags and Intent.FLAG_GRANT_READ_URI_PERMISSION
+            host.contentResolver.takePersistableUriPermission(treeUri, flags)
+
+            io.execute {
+                try {
+                    val rootDocId = DocumentsContract.getTreeDocumentId(treeUri)
+                    var rootName = "Carpeta"
+                    val rootDocUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, rootDocId)
+                    host.contentResolver.query(rootDocUri, arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME), null, null, null)?.use { cursor ->
+                        if (cursor.moveToFirst()) {
+                            val idx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                            if (idx >= 0) cursor.getString(idx)?.let { if (it.isNotBlank()) rootName = it }
+                        }
+                    }
+
+                    val folders = mutableListOf<String>()
+                    val files = mutableListOf<JSObject>()
+                    var totalBytes = 0L
+
+                    fun traverse(docId: String, currentRelPath: String) {
+                        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, docId)
+                        val projection = arrayOf(
+                            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                            DocumentsContract.Document.COLUMN_MIME_TYPE,
+                            DocumentsContract.Document.COLUMN_SIZE
+                        )
+                        host.contentResolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
+                            val idIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+                            val nameIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                            val mimeIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
+                            val sizeIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_SIZE)
+
+                            while (cursor.moveToNext()) {
+                                val childId = cursor.getString(idIdx) ?: continue
+                                val displayName = cursor.getString(nameIdx) ?: "archivo"
+                                val mimeType = cursor.getString(mimeIdx) ?: ""
+                                val size = if (sizeIdx >= 0 && !cursor.isNull(sizeIdx)) cursor.getLong(sizeIdx) else 0L
+
+                                if (displayName.startsWith(".") || displayName.equals("thumbs.db", ignoreCase = true)) continue
+
+                                val relPath = if (currentRelPath.isEmpty()) displayName else "$currentRelPath/$displayName"
+
+                                if (mimeType == DocumentsContract.Document.MIME_TYPE_DIR) {
+                                    folders.add(relPath)
+                                    traverse(childId, relPath)
+                                } else {
+                                    val fileDocUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, childId)
+                                    val staged = stageContentUriInternal(fileDocUri)
+                                    val item = JSObject().apply {
+                                        put("relativePath", relPath)
+                                        put("absolutePath", staged)
+                                        put("size", size)
+                                    }
+                                    files.add(item)
+                                    totalBytes += size
+                                }
+                            }
+                        }
+                    }
+
+                    traverse(rootDocId, "")
+
+                    folders.sortWith(compareBy({ it.count { c -> c == '/' } }, { it }))
+
+                    val response = JSObject().apply {
+                        put("cancelled", false)
+                        put("rootName", rootName)
+                        put("folders", JSONArray(folders))
+                        val filesArray = JSONArray()
+                        for (f in files) filesArray.put(f)
+                        put("files", filesArray)
+                        put("totalBytes", totalBytes)
+                    }
+                    invoke.resolve(response)
+                } catch (e: Exception) {
+                    invoke.reject(e.message ?: "Error al procesar carpeta de Android")
+                }
+            }
+        } catch (error: Exception) {
+            invoke.reject(error.message ?: "No se pudo seleccionar la carpeta")
         }
     }
 
