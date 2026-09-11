@@ -459,18 +459,24 @@ class NuvioMobilePlugin(private val host: Activity) : Plugin(host) {
                 } else {
                     "${args.scanned} mensajes revisados…"
                 }
-                builder.setContentTitle(title)
-                    .setContentText(contentText)
-                    .setOngoing(true)
-                    .setAutoCancel(false)
-                    .setCategory(NotificationCompat.CATEGORY_PROGRESS)
 
-                if (args.percent != null) {
-                    builder.setProgress(100, args.percent!!.coerceIn(0, 100), false)
-                } else {
-                    builder.setProgress(100, 0, true)
+                val intent = Intent(host, NuvioForegroundService::class.java).apply {
+                    action = NuvioForegroundService.ACTION_UPDATE_SYNC
+                    putExtra("title", title)
+                    putExtra("content", contentText)
+                    if (args.percent != null) {
+                        putExtra("percent", args.percent!!)
+                    } else {
+                        putExtra("indeterminate", true)
+                    }
                 }
+                ContextCompat.startForegroundService(host, intent)
             } else {
+                val intent = Intent(host, NuvioForegroundService::class.java).apply {
+                    action = NuvioForegroundService.ACTION_STOP_SYNC
+                }
+                host.startService(intent)
+
                 builder.setOngoing(false)
                     .setAutoCancel(true)
                     .setProgress(0, 0, false)
@@ -482,9 +488,9 @@ class NuvioMobilePlugin(private val host: Activity) : Plugin(host) {
                     builder.setContentTitle("Sincronización completada")
                         .setContentText("${args.scanned} mensajes revisados · Catálogo al día")
                 }
+                notificationManager.notify(SYNC_NOTIFICATION_ID, builder.build())
             }
 
-            notificationManager.notify(SYNC_NOTIFICATION_ID, builder.build())
             invoke.resolve(JSObject().apply { put("posted", true) })
         } catch (e: Exception) {
             invoke.reject(e.message ?: "Error al actualizar notificación de sincronización")
@@ -518,20 +524,25 @@ class NuvioMobilePlugin(private val host: Activity) : Plugin(host) {
                 val sizeText = if (args.totalBytes > 0) " · ${formatSize(args.processedBytes)} de ${formatSize(args.totalBytes)}" else ""
                 val contentText = "${args.completed} de ${args.total} completados$sizeText$speedText"
 
-                builder.setContentTitle(title)
-                    .setContentText(contentText)
-                    .setOngoing(true)
-                    .setAutoCancel(false)
-                    .setCategory(NotificationCompat.CATEGORY_PROGRESS)
-
                 val pct = args.percent ?: if (args.totalBytes > 0) {
                     ((args.processedBytes.toDouble() / args.totalBytes.toDouble()) * 100).toInt().coerceIn(0, 100)
                 } else if (args.total > 0) {
                     ((args.completed.toDouble() / args.total.toDouble()) * 100).toInt().coerceIn(0, 100)
                 } else 0
 
-                builder.setProgress(100, pct, false)
+                val intent = Intent(host, NuvioForegroundService::class.java).apply {
+                    action = NuvioForegroundService.ACTION_UPDATE_UPLOAD
+                    putExtra("title", title)
+                    putExtra("content", contentText)
+                    putExtra("percent", pct)
+                }
+                ContextCompat.startForegroundService(host, intent)
             } else {
+                val intent = Intent(host, NuvioForegroundService::class.java).apply {
+                    action = NuvioForegroundService.ACTION_STOP_UPLOAD
+                }
+                host.startService(intent)
+
                 builder.setOngoing(false)
                     .setAutoCancel(true)
                     .setProgress(0, 0, false)
@@ -543,6 +554,7 @@ class NuvioMobilePlugin(private val host: Activity) : Plugin(host) {
                     builder.setContentTitle("Subidas completadas")
                         .setContentText("${args.total} archivos subidos correctamente a Telegram")
                 }
+                notificationManager.notify(UPLOAD_NOTIFICATION_ID, builder.build())
             }
 
             notificationManager.notify(UPLOAD_NOTIFICATION_ID, builder.build())
