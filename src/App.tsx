@@ -100,10 +100,13 @@ import {
   submitTelegramEmailCode,
   submitTelegramPassword,
   submitTelegramPhone,
+  submitTelegramPhoneSms,
+  resetTelegramToPhone,
   syncFiles,
-  updateSyncNotification,
-  updateUploadNotification,
+  getPlatform,
   updateSetting,
+  MAX_UPLOAD_BATCH_MOBILE,
+  MAX_UPLOAD_BATCH_DESKTOP,
 } from "./bridge";
 import type {
   CloudFile,
@@ -355,6 +358,11 @@ function isTransferPending(job: TransferJob) {
   return !["completed", "failed", "duplicate", "cancelled"].includes(job.status);
 }
 
+const isMobileOrTouch = typeof window !== "undefined" && (
+  /android|iphone|ipad|ipod/i.test(navigator.userAgent) ||
+  (navigator.maxTouchPoints > 0 && window.matchMedia("(max-width: 920px)").matches)
+);
+
 function App() {
   const [dashboard, setDashboard] = useState<DashboardData | null>(null);
   const [section, setSection] = useState<SectionKey>("home");
@@ -543,88 +551,19 @@ function App() {
     return () => { disposed = true; dashboardRequestRef.current++; mediaRequestRef.current++; window.clearTimeout(timer); };
   }, []);
 
-  const previousSyncActiveRef = useRef(false);
-  const previousSyncKeyRef = useRef<string>("");
+  const notificationPermissionRequested = useRef(false);
   useEffect(() => {
-    if (!dashboard) return;
-    const sync = dashboard.syncProgress;
-    const active = Boolean(sync?.active);
-    const wasActive = previousSyncActiveRef.current;
-    if (active) {
-      previousSyncActiveRef.current = true;
-      const key = `${sync?.percent}:${sync?.scanned}:${sync?.phase}`;
-      if (key !== previousSyncKeyRef.current) {
-        previousSyncKeyRef.current = key;
-        void updateSyncNotification({
-          active: true,
-          percent: sync?.percent,
-          scanned: sync?.scanned ?? 0,
-          total: sync?.total,
-          phase: sync?.phase,
-          error: sync?.error,
-        });
-      }
-    } else if (wasActive) {
-      previousSyncActiveRef.current = false;
-      previousSyncKeyRef.current = "";
-      void updateSyncNotification({
-        active: false,
-        percent: 100,
-        scanned: sync?.scanned ?? 0,
-        total: sync?.total,
-        phase: sync?.phase ?? "complete",
-        error: sync?.error,
-      });
-    }
-  }, [dashboard?.syncProgress?.active, dashboard?.syncProgress?.percent, dashboard?.syncProgress?.scanned, dashboard?.syncProgress?.phase, dashboard?.syncProgress?.error]);
-
-  const previousUploadActiveRef = useRef(false);
-  const previousUploadKeyRef = useRef<string>("");
-  useEffect(() => {
-    if (!dashboard) return;
-    const q = dashboard.queueSummary;
-    const activeUploads = dashboard.transfers.filter(
-      (t) => t.direction === "upload" && isTransferPending(t)
-    );
-    const hasActive = activeUploads.length > 0 || (q.pending > 0 && q.active > 0);
-    const wasActive = previousUploadActiveRef.current;
-
-    if (hasActive) {
-      previousUploadActiveRef.current = true;
-      const currentFileName = activeUploads[0]?.fileName ?? null;
-      const pct = q.totalBytes > 0 ? Math.round((q.processedBytes / q.totalBytes) * 100) : null;
-      const key = `${pct}:${q.completed}:${q.pending}:${currentFileName}:${Math.round(q.speedBps / 50000)}`;
-      if (key !== previousUploadKeyRef.current) {
-        previousUploadKeyRef.current = key;
-        void updateUploadNotification({
-          active: true,
-          total: q.total,
-          completed: q.completed,
-          pending: q.pending,
-          failed: q.failed,
-          percent: pct,
-          processedBytes: q.processedBytes,
-          totalBytes: q.totalBytes,
-          speedBps: q.speedBps,
-          currentFileName,
-        });
-      }
-    } else if (wasActive) {
-      previousUploadActiveRef.current = false;
-      previousUploadKeyRef.current = "";
-      void updateUploadNotification({
-        active: false,
-        total: q.total,
-        completed: q.completed,
-        pending: 0,
-        failed: q.failed,
-        percent: 100,
-        processedBytes: q.totalBytes,
-        totalBytes: q.totalBytes,
-        speedBps: 0,
-      });
-    }
-  }, [dashboard?.queueSummary?.pending, dashboard?.queueSummary?.completed, dashboard?.queueSummary?.processedBytes, dashboard?.queueSummary?.speedBps, dashboard?.transfers]);
+    if (notificationPermissionRequested.current) return;
+    notificationPermissionRequested.current = true;
+    void (async () => {
+      try {
+        if (await getPlatform() !== "android") return;
+        let granted = await isPermissionGranted();
+        if (!granted) granted = (await requestPermission()) === "granted";
+        if (!granted) setAppNotice("Activa las notificaciones de Nuvio en Ajustes de Android para ver el progreso fuera de la aplicación.");
+      } catch { /* Android can deny notification permission without blocking the app. */ }
+    })();
+  }, []);
 
   useEffect(() => {
     document.documentElement.dataset.theme = darkMode ? "dark" : "light";
@@ -646,6 +585,7 @@ function App() {
     );
     void (async () => {
       try {
+        if (await getPlatform() === "android") return;
         let granted = await isPermissionGranted();
         if (!granted) granted = (await requestPermission()) === "granted";
         if (granted) {
@@ -856,6 +796,14 @@ function App() {
     try {
       const selected = await selectFilesForUpload();
       if (!selected.length) return;
+      const isAndroid = (await getPlatform()) === "android";
+      const maxBatch = isAndroid ? MAX_UPLOAD_BATCH_MOBILE : MAX_UPLOAD_BATCH_DESKTOP;
+      if (selected.length > maxBatch) {
+        setAppNotice(
+          `Has seleccionado ${selected.length} archivos. Para garantizar la estabilidad del sistema, el límite máximo por lote es de ${maxBatch} archivos. Te sugerimos subirlos en lotes menores o comprimirlos en un archivo ZIP.`
+        );
+        return;
+      }
       const targetFolderId = section === "files" ? currentFolderId : null;
       if (section !== "files") setCurrentFolderId(null);
       setSection("files");
@@ -901,6 +849,14 @@ function App() {
   ): Promise<void> => {
     if (!plan.files.length && !plan.folders.length) {
       setAppNotice(`La carpeta "${plan.rootName}" está vacía.`);
+      return;
+    }
+    const isAndroid = (await getPlatform()) === "android";
+    const maxBatch = isAndroid ? MAX_UPLOAD_BATCH_MOBILE : MAX_UPLOAD_BATCH_DESKTOP;
+    if (plan.files.length > maxBatch && !zipBeforeUpload) {
+      setAppNotice(
+        `La carpeta "${plan.rootName}" contiene ${plan.files.length} archivos. El límite máximo por lote es de ${maxBatch} archivos. Activa la opción de comprimir en ZIP o sube carpetas más pequeñas.`
+      );
       return;
     }
     if (zipBeforeUpload && plan.files.length > 0) {
@@ -1060,6 +1016,13 @@ function App() {
         await executeUploadFolderPlan(plan, targetFolderId);
       }
 
+      if (files.length > MAX_UPLOAD_BATCH_DESKTOP) {
+        setAppNotice(
+          `Has arrastrado ${files.length} archivos. Para garantizar la estabilidad, el límite máximo por lote es de ${MAX_UPLOAD_BATCH_DESKTOP} archivos. Por favor arrastra menos archivos o comprímelos en un archivo ZIP.`
+        );
+        return;
+      }
+
       if (files.length > 0) {
         const filePaths = files.map((f) => f.path);
         setAppNotice(`Preparando ${files.length} archivo${files.length === 1 ? "" : "s"}…`);
@@ -1118,7 +1081,7 @@ function App() {
     }
   }, [dashboard?.syncProgress?.active, dashboard?.syncProgress?.phase, syncDismissed]);
 
-  const handleSync = async () => {
+  const handleSync = async (forceFull = false) => {
     if (isSyncing) {
       setAppNotice("La sincronización ya está en curso y actualizándose en vivo.");
       return;
@@ -1126,8 +1089,14 @@ function App() {
     setSyncBusy(true);
     setSyncDismissed(false);
     await action(async () => {
-      const count = await syncFiles();
-      setAppNotice(`${count} archivos de Nuvio encontrados en Mensajes guardados.`);
+      const count = await syncFiles(forceFull);
+      if (forceFull) {
+        setAppNotice(`Sincronización completa: ${count} archivos procesados.`);
+      } else if (count > 0) {
+        setAppNotice(`${count} archivo${count === 1 ? "" : "s"} nuevo${count === 1 ? "" : "s"} sincronizado${count === 1 ? "" : "s"}.`);
+      } else {
+        setAppNotice("Tu catálogo ya está al día con la nube.");
+      }
     });
     setSyncBusy(false);
   };
@@ -1461,7 +1430,7 @@ function App() {
       return;
     }
     event.preventDefault();
-    const key = dropTargetKeyAt(event.clientX, event.clientY);
+    const key = dropTargetKeyAt(event.clientX, event.clientY) ?? touch.lastTarget;
     const ids = touch.ids;
     clearFileDrag();
     if (key == null) {
@@ -1663,7 +1632,7 @@ function App() {
             <div className="heading-actions">
               {section === "files" && <button className="secondary-button folder-create-button" disabled={!dashboard.telegramConnected} onClick={() => setFolderEditor({ mode: "create" })}><FolderPlus size={17} /> Nueva carpeta</button>}
               <button className="secondary-button folder-upload-button" disabled={uploadBusy || !dashboard.telegramConnected} onClick={() => void handleUploadFolder()}><FolderUp size={17} /> Subir carpeta</button>
-              <button className={`secondary-button sync-action-button ${isSyncing ? "is-syncing" : ""}`} disabled={isSyncing || !dashboard.telegramConnected} onClick={() => void handleSync()} title={isSyncing ? "Sincronización en curso con Telegram…" : "Sincronizar con Telegram"} aria-label={isSyncing ? "Sincronizando…" : "Sincronizar"}><RefreshCw size={17} className={isSyncing ? "spin-icon" : ""} /><span className="sync-button-label">{isSyncing ? "Sincronizando…" : "Sincronizar"}</span></button>
+              <button className={`secondary-button sync-action-button ${isSyncing ? "is-syncing" : ""}`} disabled={isSyncing || !dashboard.telegramConnected} onClick={() => void handleSync()} onContextMenu={(e) => { e.preventDefault(); void handleSync(true); }} title={isSyncing ? "Sincronización en curso con Telegram…" : "Sincronizar cambios recientes (clic derecho para sincronización completa)"} aria-label={isSyncing ? "Sincronizando…" : "Sincronizar"}><RefreshCw size={17} className={isSyncing ? "spin-icon" : ""} /><span className="sync-button-label">{isSyncing ? "Sincronizando…" : "Sincronizar"}</span></button>
               <button className="primary-button" onClick={() => void handleUpload()} disabled={uploadBusy}><Upload size={17} /> {uploadBusy ? "Preparando…" : "Subir"}</button>
             </div>
           </section>
@@ -2229,6 +2198,8 @@ function PdfPreview({ source, onError }: { source: string; onError: (message: st
   return <div className="pdf-preview">{loading && <div className="preview-loading"><RefreshCw size={19} /> Renderizando primera página…</div>}<canvas ref={canvasRef} /></div>;
 }
 
+type AuthMethod = "telegram" | "sms" | "qr" | "email";
+
 function TelegramConnectModal({ rememberDefault, onClose, onChanged }: { rememberDefault: boolean; onClose: () => void; onChanged: (snapshot: TelegramAuthSnapshot) => void | Promise<void> }) {
   const [snapshot, setSnapshot] = useState<TelegramAuthSnapshot | null>(null);
   const [busy, setBusy] = useState(false);
@@ -2236,6 +2207,7 @@ function TelegramConnectModal({ rememberDefault, onClose, onChanged }: { remembe
   const [rememberSession, setRememberSession] = useState(rememberDefault);
   const [apiId, setApiId] = useState("");
   const [apiHash, setApiHash] = useState("");
+  const [selectedMethod, setSelectedMethod] = useState<AuthMethod>("telegram");
   const [phone, setPhone] = useState(() => `${detectCountryCallingCode()} `);
   const [editingPhone, setEditingPhone] = useState(false);
   const [resendCooldown, setResendCooldown] = useState(0);
@@ -2246,7 +2218,14 @@ function TelegramConnectModal({ rememberDefault, onClose, onChanged }: { remembe
   const [firstName, setFirstName] = useState("");
   const [lastName, setLastName] = useState("");
 
-  const applySnapshot = async (next: TelegramAuthSnapshot) => { setSnapshot(next); setError(null); await onChanged(next); };
+  const applySnapshot = async (next: TelegramAuthSnapshot) => {
+    setSnapshot(next);
+    setError(null);
+    if (next.stage === "code" && typeof next.timeout === "number" && next.timeout > 0) {
+      setResendCooldown(next.timeout);
+    }
+    await onChanged(next);
+  };
   const refresh = async () => { try { await applySnapshot(await getTelegramAuthState()); } catch (value) { setError(readableError(value)); } };
   useEffect(() => { void refresh(); }, []);
   useEffect(() => {
@@ -2254,6 +2233,14 @@ function TelegramConnectModal({ rememberDefault, onClose, onChanged }: { remembe
     if (!snapshot || !stages.has(snapshot.stage)) return;
     const timer = window.setInterval(() => void refresh(), 1400);
     return () => window.clearInterval(timer);
+  }, [snapshot?.stage]);
+
+  useEffect(() => {
+    if (snapshot?.stage === "qr" && selectedMethod !== "qr") {
+      setSelectedMethod("qr");
+    } else if (snapshot?.stage === "email" && selectedMethod !== "email") {
+      setSelectedMethod("email");
+    }
   }, [snapshot?.stage]);
 
   useEffect(() => {
@@ -2268,6 +2255,42 @@ function TelegramConnectModal({ rememberDefault, onClose, onChanged }: { remembe
     try { await applySnapshot(await operation()); } catch (value) { setError(readableError(value)); } finally { clear?.(); setBusy(false); }
   };
 
+  const handleSelectMethod = async (method: AuthMethod) => {
+    if (busy || selectedMethod === method) return;
+    setSelectedMethod(method);
+    setError(null);
+    setResendNotice(null);
+    setResendCooldown(0);
+    if (method === "qr") {
+      if (snapshot?.stage !== "qr") {
+        void run(requestTelegramQr);
+      }
+    } else {
+      if (snapshot?.stage === "qr") {
+        void run(resetTelegramToPhone);
+      }
+    }
+  };
+
+  const handleBackToOptions = async () => {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    setResendNotice(null);
+    setResendCooldown(0);
+    setCode("");
+    setPassword("");
+    setEditingPhone(false);
+    try {
+      const fresh = await resetTelegramToPhone();
+      await applySnapshot(fresh);
+    } catch (value) {
+      setError(readableError(value));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const submit = (event: React.FormEvent) => {
     event.preventDefault();
     if (!snapshot || busy) return;
@@ -2278,8 +2301,41 @@ function TelegramConnectModal({ rememberDefault, onClose, onChanged }: { remembe
         if (!/^[a-fA-F0-9]{32}$/.test(apiHash.trim())) return setError("API Hash no parece válido");
         void run(() => configureTelegram(id, apiHash.trim(), rememberSession), () => setApiHash("")); break;
       }
-      case "phone": void run(() => submitTelegramPhone(phone.replace(/\s+/g, "").trim())); break;
-      case "email": void run(() => submitTelegramEmail(email.trim())); break;
+      case "phone":
+      case "qr": {
+        if (selectedMethod === "sms") {
+          const sanitized = phone.replace(/\s+/g, "").trim();
+          if (!sanitized.startsWith("+") || sanitized.length < 8) {
+            return setError("Usa el número en formato internacional, por ejemplo +52 seguido de los 10 dígitos de tu número");
+          }
+          void run(() => submitTelegramPhoneSms(sanitized));
+        } else if (selectedMethod === "email") {
+          const sanitized = email.trim();
+          if (!sanitized.includes("@") || sanitized.startsWith("@") || sanitized.endsWith("@")) {
+            return setError("Ingresa un correo electrónico válido");
+          }
+          void run(() => submitTelegramEmail(sanitized));
+        } else if (selectedMethod === "qr") {
+          if (snapshot.stage !== "qr") {
+            void run(requestTelegramQr);
+          }
+        } else {
+          const sanitized = phone.replace(/\s+/g, "").trim();
+          if (!sanitized.startsWith("+") || sanitized.length < 8) {
+            return setError("Usa el número en formato internacional, por ejemplo +52 seguido de los 10 dígitos de tu número");
+          }
+          void run(() => submitTelegramPhone(sanitized));
+        }
+        break;
+      }
+      case "email": {
+        const sanitized = email.trim();
+        if (!sanitized.includes("@") || sanitized.startsWith("@") || sanitized.endsWith("@")) {
+          return setError("Ingresa un correo electrónico válido");
+        }
+        void run(() => submitTelegramEmail(sanitized));
+        break;
+      }
       case "emailCode": void run(() => submitTelegramEmailCode(code), () => setCode("")); break;
       case "code": void run(() => submitTelegramCode(code), () => setCode("")); break;
       case "password": void run(() => submitTelegramPassword(password), () => setPassword("")); break;
@@ -2290,6 +2346,8 @@ function TelegramConnectModal({ rememberDefault, onClose, onChanged }: { remembe
 
   const stage = snapshot?.stage;
   const defaultLada = detectCountryCallingCode();
+  const isPreAuthStage = stage === "phone" || stage === "qr" || stage === "email";
+
   return <Dialog className="connect-modal" labelledBy="connect-title" onClose={onClose}>
     <button className="icon-button modal-close" onClick={onClose} aria-label="Cerrar"><X size={18} /></button>
     <div className="modal-brand"><Cloud size={24} /></div><div className="modal-eyebrow">Proveedor remoto</div><h2 id="connect-title">{snapshot?.connected ? "Telegram conectado" : "Conectar Telegram"}</h2><p>{snapshot?.message ?? "Consultando la conexión de Telegram…"}</p>
@@ -2299,129 +2357,350 @@ function TelegramConnectModal({ rememberDefault, onClose, onChanged }: { remembe
       <div className="auth-success-icon"><Check size={20} /></div><div><strong>{snapshot.accountLabel ?? "Cuenta de Telegram"}</strong><span>{snapshot.isPremium ? "Telegram Premium" : "Cuenta estándar"}</span><small>{rememberDefault ? "Esta sesión está marcada para recordarse en este equipo." : "La sesión no se guardará como credencial reutilizable."}</small></div>
       <div className="account-actions"><button className="secondary-button" disabled={busy} onClick={() => void run(logOutTelegram)}>Cerrar sesión</button><button className="secondary-button danger-button" disabled={busy} onClick={() => void run(forgetTelegramSession)}>Olvidar sesión</button></div>
     </div> : stage === "closed" ? <div className="auth-closed"><strong>Sesión cerrada</strong><p>{snapshot.message}</p></div> : <form className="credential-placeholder" onSubmit={submit}>
-      {stage === "needsCredentials" && <><label htmlFor="telegram-api-id">API ID</label><input id="telegram-api-id" inputMode="numeric" value={apiId} onChange={(event) => setApiId(event.target.value)} autoComplete="off" /><label htmlFor="telegram-api-hash">API Hash</label><input id="telegram-api-hash" type="password" value={apiHash} onChange={(event) => setApiHash(event.target.value)} autoComplete="off" /><label className="remember-session-control"><input type="checkbox" checked={rememberSession} onChange={(event) => setRememberSession(event.target.checked)} /><span><strong>Recordar sesión en este equipo</strong><small>Desactivado por defecto. Las credenciales se protegen con el almacén seguro de este dispositivo.</small></span></label></>}
-      {stage === "phone" && <><label htmlFor="telegram-phone">Teléfono</label><input id="telegram-phone" type="tel" value={phone} onChange={(event) => setPhone(event.target.value)} placeholder={`${defaultLada}XXXXXXXXXX`} autoComplete="tel" autoFocus /></>}
-      {stage === "email" && <><label htmlFor="telegram-email">Correo de autenticación</label><input id="telegram-email" type="email" value={email} onChange={(event) => setEmail(event.target.value)} autoComplete="email" /></>}
-      {(stage === "code" || stage === "emailCode") && (
-        editingPhone ? (
-          <div className="auth-correct-phone-container">
-            <label htmlFor="telegram-phone-edit">Corregir o cambiar número de teléfono</label>
-            <span className="auth-hint">Ingresa tu número correcto con código de país (ej. {defaultLada}1234567890)</span>
-            <input
-              id="telegram-phone-edit"
-              type="tel"
-              value={phone}
-              onChange={(event) => setPhone(event.target.value)}
-              placeholder={`${defaultLada}XXXXXXXXXX`}
-              autoComplete="tel"
-              autoFocus
-            />
-            <div className="auth-recovery-actions">
-              <button
-                className="primary-button modal-primary"
-                type="button"
-                disabled={busy}
-                onClick={() => {
-                  const sanitized = phone.replace(/\s+/g, "").trim();
-                  if (!sanitized.startsWith("+") || sanitized.length < 8) {
-                    return setError("Usa el número en formato internacional, por ejemplo +52 seguido de tu número");
-                  }
-                  void run(
-                    () => submitTelegramPhone(sanitized),
-                    () => {
-                      setEditingPhone(false);
-                      setCode("");
-                      setResendNotice("Código solicitado al número corregido.");
-                    },
-                  );
-                }}
-              >
-                {busy ? "Enviando…" : "Reenviar código al nuevo número"}
-              </button>
-              <button
-                className="secondary-button modal-secondary"
-                type="button"
-                disabled={busy}
-                onClick={() => {
-                  setEditingPhone(false);
-                  setError(null);
-                }}
-              >
-                Cancelar y volver a ingresar código
-              </button>
-            </div>
+      {stage === "needsCredentials" && <><label htmlFor="telegram-api-id">API ID</label><input id="telegram-api-id" inputMode="numeric" value={apiId} onChange={(event) => setApiId(event.target.value)} autoComplete="off" /><label htmlFor="telegram-api-hash">API Hash</label><input id="telegram-api-hash" type="password" value={apiHash} onChange={(event) => setApiHash(event.target.value)} autoComplete="off" /><label className="remember-session-control"><input type="checkbox" checked={rememberSession} onChange={(event) => setRememberSession(event.target.checked)} /><span><strong>Recordar sesión en este equipo</strong><small>Desactivado por defecto. Las credenciales se protegen con el almacén seguro de este dispositivo.</small></span></label><button className="primary-button modal-primary" type="submit" disabled={busy}>{busy ? "Procesando…" : "Continuar con Telegram"}</button></>}
+      
+      {isPreAuthStage && (
+        <>
+          <div className="auth-methods-nav" role="tablist" aria-label="Opciones de inicio de sesión">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={selectedMethod === "telegram"}
+              className={`auth-method-tab ${selectedMethod === "telegram" ? "active" : ""}`}
+              disabled={busy}
+              onClick={() => void handleSelectMethod("telegram")}
+            >
+              <span style={{ fontSize: "15px" }}>💬</span>
+              <span>App Telegram</span>
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={selectedMethod === "sms"}
+              className={`auth-method-tab ${selectedMethod === "sms" ? "active" : ""}`}
+              disabled={busy}
+              onClick={() => void handleSelectMethod("sms")}
+            >
+              <span style={{ fontSize: "15px" }}>📱</span>
+              <span>SMS directo</span>
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={selectedMethod === "qr"}
+              className={`auth-method-tab ${selectedMethod === "qr" ? "active" : ""}`}
+              disabled={busy}
+              onClick={() => void handleSelectMethod("qr")}
+            >
+              <span style={{ fontSize: "15px" }}>📷</span>
+              <span>Código QR</span>
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={selectedMethod === "email"}
+              className={`auth-method-tab ${selectedMethod === "email" ? "active" : ""}`}
+              disabled={busy}
+              onClick={() => void handleSelectMethod("email")}
+            >
+              <span style={{ fontSize: "15px" }}>✉️</span>
+              <span>Correo</span>
+            </button>
           </div>
-        ) : (
-          <>
-            <label htmlFor="telegram-code">{stage === "emailCode" ? "Código de correo" : "Código de Telegram"}</label>
-            {snapshot.hint && <span className="auth-hint">{snapshot.hint}</span>}
-            <input id="telegram-code" inputMode="numeric" value={code} onChange={(event) => setCode(event.target.value)} autoComplete="one-time-code" autoFocus />
-            <div className="auth-recovery-buttons">
-              <button
-                type="button"
-                className="auth-link-button"
-                disabled={busy}
-                onClick={() => {
-                  setEditingPhone(true);
-                  setError(null);
-                  setResendNotice(null);
-                }}
-              >
-                ¿Te equivocaste de número? Corregir número
+
+          {selectedMethod === "telegram" && (
+            <>
+              <div className="auth-method-desc">
+                Se enviará un código de verificación a tu app oficial de Telegram (en tu teléfono celular o aplicación de escritorio).
+              </div>
+              <label htmlFor="telegram-phone">Número de teléfono celular</label>
+              <input
+                id="telegram-phone"
+                type="tel"
+                value={phone}
+                onChange={(event) => setPhone(event.target.value)}
+                placeholder={`${defaultLada}XXXXXXXXXX`}
+                autoComplete="tel"
+                autoFocus
+              />
+              <button className="primary-button modal-primary" type="submit" disabled={busy}>
+                {busy ? "Enviando…" : "💬 Enviar código a Telegram"}
               </button>
-              <button
-                type="button"
-                className="auth-link-button"
-                disabled={busy || resendCooldown > 0}
-                onClick={async () => {
-                  if (busy || resendCooldown > 0) return;
-                  try {
-                    setBusy(true);
-                    setError(null);
-                    if (stage === "code") {
-                      await applySnapshot(await resendTelegramCode());
-                    } else {
-                      await applySnapshot(await submitTelegramEmail(email));
-                    }
-                    setResendNotice("Se ha solicitado el reenvío del código.");
-                    setResendCooldown(30);
-                  } catch (value) {
-                    setError(readableError(value));
-                  } finally {
-                    setBusy(false);
-                  }
-                }}
-              >
-                {resendCooldown > 0 ? `Reenviar código (${resendCooldown}s)` : "¿No te llega el código? Reenviar código"}
+            </>
+          )}
+
+          {selectedMethod === "sms" && (
+            <>
+              <div className="auth-method-desc">
+                Se enviará un código de verificación por mensaje de texto SMS tradicional directamente a tu celular (fuera de Telegram).
+              </div>
+              <label htmlFor="telegram-phone-sms">Número de teléfono celular</label>
+              <input
+                id="telegram-phone-sms"
+                type="tel"
+                value={phone}
+                onChange={(event) => setPhone(event.target.value)}
+                placeholder={`${defaultLada}XXXXXXXXXX`}
+                autoComplete="tel"
+                autoFocus
+              />
+              <button className="primary-button modal-primary" type="submit" disabled={busy}>
+                {busy ? "Enviando…" : "📱 Enviar código por SMS directo"}
               </button>
+            </>
+          )}
+
+          {selectedMethod === "qr" && (
+            <div className="qr-auth-card">
+              <strong>Autoriza escaneando desde Telegram</strong>
+              <span>Abre Telegram en tu celular → Ajustes → Dispositivos → Vincular dispositivo de escritorio.</span>
+              {snapshot.qrSvg ? (
+                <img className="auth-qr" alt="QR de Telegram" src={`data:image/svg+xml;charset=utf-8,${encodeURIComponent(snapshot.qrSvg)}`} />
+              ) : (
+                <div className="auth-loading" style={{ margin: "16px 0" }}>Generando código QR…</div>
+              )}
             </div>
-            {resendNotice && <div className="auth-resend-notice">{resendNotice}</div>}
-          </>
-        )
+          )}
+
+          {selectedMethod === "email" && (
+            <>
+              <div className="auth-method-desc">
+                Para cuentas de Telegram que tengan configurado inicio de sesión mediante correo electrónico.
+              </div>
+              <label htmlFor="telegram-email">Correo de autenticación</label>
+              <input
+                id="telegram-email"
+                type="email"
+                value={email}
+                onChange={(event) => setEmail(event.target.value)}
+                placeholder="usuario@ejemplo.com"
+                autoComplete="email"
+                autoFocus
+              />
+              <button className="primary-button modal-primary" type="submit" disabled={busy}>
+                {busy ? "Enviando…" : "✉️ Enviar código al correo"}
+              </button>
+            </>
+          )}
+        </>
       )}
-      {stage === "password" && <><label htmlFor="telegram-password">Contraseña 2FA</label>{snapshot.hint && <span className="auth-hint">Pista: {snapshot.hint}</span>}<input id="telegram-password" type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="current-password" /></>}
-      {stage === "registration" && <><label htmlFor="telegram-first-name">Nombre</label><input id="telegram-first-name" value={firstName} onChange={(event) => setFirstName(event.target.value)} /><label htmlFor="telegram-last-name">Apellido</label><input id="telegram-last-name" value={lastName} onChange={(event) => setLastName(event.target.value)} /></>}
-      {stage === "qr" && <div className="qr-auth-card"><strong>Autoriza desde Telegram</strong><span>Telegram → Ajustes → Dispositivos → Vincular dispositivo de escritorio.</span>{snapshot.qrSvg && <img className="auth-qr" alt="QR de Telegram" src={`data:image/svg+xml;charset=utf-8,${encodeURIComponent(snapshot.qrSvg)}`} />}</div>}
+
+      {(stage === "code" || stage === "emailCode" || stage === "password") && editingPhone ? (
+        <div className="auth-correct-phone-container">
+          <label htmlFor="telegram-phone-edit">Corregir o cambiar número de teléfono</label>
+          <span className="auth-hint">Ingresa tu número correcto con código de país (ej. {defaultLada}XXXXXXXXXX)</span>
+          <input
+            id="telegram-phone-edit"
+            type="tel"
+            value={phone}
+            onChange={(event) => setPhone(event.target.value)}
+            placeholder={`${defaultLada}XXXXXXXXXX`}
+            autoComplete="tel"
+            autoFocus
+          />
+          <div className="auth-recovery-actions">
+            <button
+              className="primary-button modal-primary"
+              type="button"
+              disabled={busy}
+              onClick={() => {
+                const sanitized = phone.replace(/\s+/g, "").trim();
+                if (!sanitized.startsWith("+") || sanitized.length < 8) {
+                  return setError("Usa el número en formato internacional, por ejemplo +52 seguido de tu número");
+                }
+                void run(
+                  () => submitTelegramPhone(sanitized),
+                  () => {
+                    setEditingPhone(false);
+                    setCode("");
+                    setResendNotice("Código solicitado al número corregido.");
+                  },
+                );
+              }}
+            >
+              {busy ? "Enviando…" : "Reenviar código al nuevo número"}
+            </button>
+            <button
+              className="secondary-button modal-secondary"
+              type="button"
+              disabled={busy}
+              onClick={() => {
+                setEditingPhone(false);
+                setError(null);
+              }}
+            >
+              Cancelar y volver
+            </button>
+          </div>
+        </div>
+      ) : (
+        <>
+          {(stage === "code" || stage === "emailCode") && (
+            <>
+              <label htmlFor="telegram-code">{stage === "emailCode" ? "Código de correo" : "Código de verificación"}</label>
+              {snapshot.hint && <span className="auth-hint">{snapshot.hint}</span>}
+              <input id="telegram-code" inputMode="numeric" value={code} onChange={(event) => setCode(event.target.value)} autoComplete="one-time-code" autoFocus />
+              <button className="primary-button modal-primary" type="submit" disabled={busy}>{busy ? "Procesando…" : (stage === "emailCode" ? "Verificar correo" : "Verificar código")}</button>
+              
+              <div className="auth-recovery-buttons">
+                {stage === "code" ? (
+                  <>
+                    {snapshot.nextCodeType === "none" ? (
+                      <div className="auth-channel-info" style={{ margin: "4px 0 8px", fontSize: "0.82rem", color: "var(--muted)", lineHeight: 1.4 }}>
+                        ℹ️ Telegram no permite reenviar el código por SMS o llamada para esta cuenta. Revisa tu app oficial en otro dispositivo o vincula mediante Código QR.
+                      </div>
+                    ) : resendCooldown > 0 ? (
+                      <div className="auth-cooldown-container">
+                        <div className="auth-cooldown-text">
+                          ⏳ {snapshot.nextCodeType === "call" ? "Podrás solicitar llamada telefónica en " : "Podrás solicitar código por SMS en "}
+                          <strong>{Math.floor(resendCooldown / 60)}:{String(resendCooldown % 60).padStart(2, "0")}</strong>
+                        </div>
+                        <button
+                          type="button"
+                          className="auth-link-button auth-cooldown-btn"
+                          disabled={true}
+                        >
+                          {snapshot.nextCodeType === "call"
+                            ? `📞 Esperar ${resendCooldown}s para llamada telefónica`
+                            : `📱 Esperar ${resendCooldown}s para SMS directo`}
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        type="button"
+                        className="primary-button modal-secondary auth-resend-active-btn"
+                        disabled={busy}
+                        onClick={async () => {
+                          if (busy) return;
+                          try {
+                            setBusy(true);
+                            setError(null);
+                            const nextSnapshot = await resendTelegramCode();
+                            await applySnapshot(nextSnapshot);
+                            setResendNotice(
+                              nextSnapshot.nextCodeType === "call" || snapshot.nextCodeType === "call"
+                                ? "Se ha solicitado la llamada telefónica. Permanece atento a tu teléfono."
+                                : "Se ha solicitado el código por SMS directo a tu celular (fuera de Telegram)."
+                            );
+                          } catch (value) {
+                            setError(readableError(value));
+                          } finally {
+                            setBusy(false);
+                          }
+                        }}
+                      >
+                        {snapshot.nextCodeType === "call"
+                          ? "📞 Recibir código por llamada telefónica ahora"
+                          : "📱 Enviar código por SMS directo a mi celular"}
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      className="auth-link-button"
+                      disabled={busy}
+                      onClick={() => {
+                        setEditingPhone(true);
+                        setError(null);
+                        setResendNotice(null);
+                      }}
+                    >
+                      ✏️ ¿Te equivocaste de número? Corregir número
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    type="button"
+                    className="auth-link-button"
+                    disabled={busy || resendCooldown > 0}
+                    onClick={async () => {
+                      if (busy || resendCooldown > 0) return;
+                      try {
+                        setBusy(true);
+                        setError(null);
+                        await applySnapshot(await submitTelegramEmail(email));
+                        setResendNotice("Se ha solicitado el reenvío del correo.");
+                        setResendCooldown(60);
+                      } catch (value) {
+                        setError(readableError(value));
+                      } finally {
+                        setBusy(false);
+                      }
+                    }}
+                  >
+                    {resendCooldown > 0 ? `Reenviar correo (${resendCooldown}s)` : "¿No te llega el correo? Reenviar código"}
+                  </button>
+                )}
+              </div>
+
+              {stage === "code" && (
+                <div className="auth-channel-info" style={{ marginTop: "8px", fontSize: "0.82rem", color: "var(--text-muted, #888)", lineHeight: 1.4 }}>
+                  ℹ️ Telegram entrega los códigos en tu app oficial (en otros dispositivos), por SMS directo a tu celular o por llamada telefónica.
+                </div>
+              )}
+              {resendNotice && <div className="auth-resend-notice">{resendNotice}</div>}
+
+              <button
+                type="button"
+                className="auth-back-button"
+                disabled={busy}
+                onClick={handleBackToOptions}
+              >
+                ← Volver a elegir método / Cambiar opción
+              </button>
+            </>
+          )}
+
+          {stage === "password" && (
+            <>
+              <label htmlFor="telegram-password">Contraseña 2FA</label>
+              {snapshot.hint && <span className="auth-hint">Pista: {snapshot.hint}</span>}
+              <input id="telegram-password" type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="current-password" autoFocus />
+              <button className="primary-button modal-primary" type="submit" disabled={busy}>{busy ? "Procesando…" : "Verificar contraseña"}</button>
+              
+              <div className="auth-recovery-buttons">
+                <button
+                  type="button"
+                  className="auth-link-button"
+                  disabled={busy}
+                  onClick={() => {
+                    setEditingPhone(true);
+                    setError(null);
+                    setResendNotice(null);
+                  }}
+                >
+                  ✏️ ¿No es tu cuenta o número? Cambiar número
+                </button>
+              </div>
+
+              <button
+                type="button"
+                className="auth-back-button"
+                disabled={busy}
+                onClick={handleBackToOptions}
+              >
+                ← Volver a elegir método / Cambiar opción
+              </button>
+            </>
+          )}
+        </>
+      )}
+
+      {stage === "registration" && (
+        <>
+          <label htmlFor="telegram-first-name">Nombre</label>
+          <input id="telegram-first-name" value={firstName} onChange={(event) => setFirstName(event.target.value)} />
+          <label htmlFor="telegram-last-name">Apellido</label>
+          <input id="telegram-last-name" value={lastName} onChange={(event) => setLastName(event.target.value)} />
+          <button className="primary-button modal-primary" type="submit" disabled={busy}>{busy ? "Procesando…" : "Completar registro"}</button>
+        </>
+      )}
+
       {(stage === "initializing" || stage === "loggingOut" || stage === "closing") && <div className="auth-loading">{snapshot.message}</div>}
-      {!editingPhone && !new Set(["initializing", "qr", "loggingOut", "closing"]).has(stage ?? "") && <button className="primary-button modal-primary" type="submit" disabled={busy}>{busy ? "Procesando…" : authActionLabel(stage)}</button>}
-      {stage === "phone" && <button className="secondary-button modal-secondary" type="button" disabled={busy} onClick={() => void run(requestTelegramQr)}>Usar otra sesión / QR</button>}
     </form>}
     <small>Los códigos, el teléfono y la contraseña 2FA no se guardan en los logs de Nuvio.</small>
   </Dialog>;
 }
 
-function authActionLabel(stage?: TelegramAuthSnapshot["stage"]): string {
-  switch (stage) {
-    case "needsCredentials": return "Continuar con Telegram";
-    case "phone": return "Enviar código";
-    case "email": return "Continuar";
-    case "emailCode": return "Verificar correo";
-    case "code": return "Verificar código";
-    case "password": return "Verificar contraseña";
-    case "registration": return "Completar registro";
-    default: return "Continuar";
-  }
-}
 
 function SkippedUploadsModal({
   items,
@@ -2545,7 +2824,7 @@ type FileActions = {
 
 const FileCard = memo(function FileCard({ file, selected, isDragging, onSelect, onFavorite, onDownload, onPreview, onMove, onTrash, onDelete, onDragStart, onDragEnd, onPointerDown, onPointerMove, onPointerUp, onPointerCancel }: FileActions) {
   const Icon = kindIcon(file.kind);
-  return <article className={`file-card ${selected ? "selected" : ""} ${isDragging ? "is-touch-dragging" : ""}`} draggable={false} tabIndex={0} aria-label={fileName(file)} onClick={(event) => { if (!(event.target as Element).closest("button,input,label,select,a")) onSelect(); }} onKeyDown={(event) => { if (event.target === event.currentTarget && event.key === " ") { event.preventDefault(); onSelect(); } }} onDragStart={onDragStart} onDragEnd={onDragEnd} onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp} onPointerCancel={onPointerCancel}>
+  return <article className={`file-card ${selected ? "selected" : ""} ${isDragging ? "is-touch-dragging" : ""}`} draggable={!isMobileOrTouch && !file.trashed} tabIndex={0} aria-label={fileName(file)} onClick={(event) => { if (!(event.target as Element).closest("button,input,label,select,a")) onSelect(); }} onKeyDown={(event) => { if (event.target === event.currentTarget && event.key === " ") { event.preventDefault(); onSelect(); } }} onDragStart={onDragStart} onDragEnd={onDragEnd} onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp} onPointerCancel={onPointerCancel}>
     <div className={`file-preview kind-${file.kind}`}>
       <label className="file-select-checkbox"><input type="checkbox" checked={selected} onChange={onSelect} aria-label={`Seleccionar ${file.name}`} /></label>
       <FileThumbnail file={file}><div className="file-type-icon"><Icon size={27} strokeWidth={1.7} /></div></FileThumbnail>
@@ -2570,7 +2849,7 @@ const FileCard = memo(function FileCard({ file, selected, isDragging, onSelect, 
 
 const FileRow = memo(function FileRow({ file, selected, isDragging, onSelect, onFavorite, onDownload, onPreview, onMove, onTrash, onDelete, onDragStart, onDragEnd, onPointerDown, onPointerMove, onPointerUp, onPointerCancel }: FileActions) {
   const Icon = kindIcon(file.kind);
-  return <article className={`file-row ${selected ? "selected" : ""} ${isDragging ? "is-touch-dragging" : ""}`} draggable={false} tabIndex={0} aria-label={fileName(file)} onClick={(event) => { if (!(event.target as Element).closest("button,input,label,select,a")) onSelect(); }} onKeyDown={(event) => { if (event.target === event.currentTarget && event.key === " ") { event.preventDefault(); onSelect(); } }} onDragStart={onDragStart} onDragEnd={onDragEnd} onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp} onPointerCancel={onPointerCancel}>
+  return <article className={`file-row ${selected ? "selected" : ""} ${isDragging ? "is-touch-dragging" : ""}`} draggable={!isMobileOrTouch && !file.trashed} tabIndex={0} aria-label={fileName(file)} onClick={(event) => { if (!(event.target as Element).closest("button,input,label,select,a")) onSelect(); }} onKeyDown={(event) => { if (event.target === event.currentTarget && event.key === " ") { event.preventDefault(); onSelect(); } }} onDragStart={onDragStart} onDragEnd={onDragEnd} onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp} onPointerCancel={onPointerCancel}>
     <div className="file-row-name">
       <input type="checkbox" checked={selected} onChange={onSelect} aria-label={`Seleccionar ${file.name}`} />
       <div className={`small-file-icon kind-${file.kind}`}><FileThumbnail file={file}><Icon size={18} /></FileThumbnail></div>

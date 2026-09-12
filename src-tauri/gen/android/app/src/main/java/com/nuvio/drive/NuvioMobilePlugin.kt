@@ -46,6 +46,7 @@ import javax.crypto.spec.GCMParameterSpec
 @InvokeArg class SyncNotificationArgs {
     var active: Boolean = false
     var percent: Int? = null
+    var etaSeconds: Long? = null
     var scanned: Int = 0
     var total: Int? = null
     var phase: String? = null
@@ -54,6 +55,10 @@ import javax.crypto.spec.GCMParameterSpec
 @InvokeArg class UploadNotificationArgs {
     var active: Boolean = false
     var total: Int = 0
+    var etaSeconds: Long? = null
+    var paused: Int = 0
+    var cancelled: Int = 0
+    var phase: String? = null
     var completed: Int = 0
     var pending: Int = 0
     var failed: Int = 0
@@ -69,6 +74,9 @@ import javax.crypto.spec.GCMParameterSpec
 
 @TauriPlugin
 class NuvioMobilePlugin(private val host: Activity) : Plugin(host) {
+    companion object {
+        const val MAX_BATCH_UPLOAD_FILES = 250
+    }
     @Command fun backgroundApp(invoke: Invoke) {
         host.runOnUiThread { host.moveTaskToBack(true); invoke.resolve(JSObject()) }
     }
@@ -181,11 +189,20 @@ class NuvioMobilePlugin(private val host: Activity) : Plugin(host) {
             val uris = mutableListOf<Uri>()
             val data = result.data!!
             if (data.clipData != null) {
-                for (i in 0 until data.clipData!!.itemCount) {
+                val count = data.clipData!!.itemCount
+                if (count > MAX_BATCH_UPLOAD_FILES) {
+                    invoke.reject("Has seleccionado $count archivos. Para proteger la memoria y estabilidad del dispositivo móvil, el límite máximo por lote es de $MAX_BATCH_UPLOAD_FILES archivos. Te sugerimos subirlos en lotes menores o comprimirlos en un archivo ZIP.")
+                    return
+                }
+                for (i in 0 until count) {
                     uris.add(data.clipData!!.getItemAt(i).uri)
                 }
             } else if (data.data != null) {
                 uris.add(data.data!!)
+            }
+            if (uris.size > MAX_BATCH_UPLOAD_FILES) {
+                invoke.reject("Has seleccionado ${uris.size} archivos. Para proteger la memoria y estabilidad del dispositivo móvil, el límite máximo por lote es de $MAX_BATCH_UPLOAD_FILES archivos. Te sugerimos subirlos en lotes menores o comprimirlos en un archivo ZIP.")
+                return
             }
             if (uris.isEmpty()) {
                 invoke.resolve(JSObject().apply { put("paths", JSONArray()) })
@@ -270,6 +287,9 @@ class NuvioMobilePlugin(private val host: Activity) : Plugin(host) {
                                     folders.add(relPath)
                                     traverse(childId, relPath)
                                 } else {
+                                    if (files.size >= MAX_BATCH_UPLOAD_FILES) {
+                                        error("La carpeta contiene más de $MAX_BATCH_UPLOAD_FILES archivos. Para proteger la estabilidad del dispositivo móvil, el límite máximo es de $MAX_BATCH_UPLOAD_FILES archivos. Sube carpetas más pequeñas o comprímela en un archivo ZIP.")
+                                    }
                                     val fileDocUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, childId)
                                     val staged = stageContentUriInternal(fileDocUri)
                                     val item = JSObject().apply {
@@ -459,24 +479,18 @@ class NuvioMobilePlugin(private val host: Activity) : Plugin(host) {
                 } else {
                     "${args.scanned} mensajes revisados…"
                 }
+                builder.setContentTitle(title)
+                    .setContentText(contentText)
+                    .setOngoing(true)
+                    .setAutoCancel(false)
+                    .setCategory(NotificationCompat.CATEGORY_PROGRESS)
 
-                val intent = Intent(host, NuvioForegroundService::class.java).apply {
-                    action = NuvioForegroundService.ACTION_UPDATE_SYNC
-                    putExtra("title", title)
-                    putExtra("content", contentText)
-                    if (args.percent != null) {
-                        putExtra("percent", args.percent!!)
-                    } else {
-                        putExtra("indeterminate", true)
-                    }
+                if (args.percent != null) {
+                    builder.setProgress(100, args.percent!!.coerceIn(0, 100), false)
+                } else {
+                    builder.setProgress(100, 0, true)
                 }
-                ContextCompat.startForegroundService(host, intent)
             } else {
-                val intent = Intent(host, NuvioForegroundService::class.java).apply {
-                    action = NuvioForegroundService.ACTION_STOP_SYNC
-                }
-                host.startService(intent)
-
                 builder.setOngoing(false)
                     .setAutoCancel(true)
                     .setProgress(0, 0, false)
@@ -488,9 +502,9 @@ class NuvioMobilePlugin(private val host: Activity) : Plugin(host) {
                     builder.setContentTitle("Sincronización completada")
                         .setContentText("${args.scanned} mensajes revisados · Catálogo al día")
                 }
-                notificationManager.notify(SYNC_NOTIFICATION_ID, builder.build())
             }
 
+            notificationManager.notify(SYNC_NOTIFICATION_ID, builder.build())
             invoke.resolve(JSObject().apply { put("posted", true) })
         } catch (e: Exception) {
             invoke.reject(e.message ?: "Error al actualizar notificación de sincronización")
@@ -524,25 +538,20 @@ class NuvioMobilePlugin(private val host: Activity) : Plugin(host) {
                 val sizeText = if (args.totalBytes > 0) " · ${formatSize(args.processedBytes)} de ${formatSize(args.totalBytes)}" else ""
                 val contentText = "${args.completed} de ${args.total} completados$sizeText$speedText"
 
+                builder.setContentTitle(title)
+                    .setContentText(contentText)
+                    .setOngoing(true)
+                    .setAutoCancel(false)
+                    .setCategory(NotificationCompat.CATEGORY_PROGRESS)
+
                 val pct = args.percent ?: if (args.totalBytes > 0) {
                     ((args.processedBytes.toDouble() / args.totalBytes.toDouble()) * 100).toInt().coerceIn(0, 100)
                 } else if (args.total > 0) {
                     ((args.completed.toDouble() / args.total.toDouble()) * 100).toInt().coerceIn(0, 100)
                 } else 0
 
-                val intent = Intent(host, NuvioForegroundService::class.java).apply {
-                    action = NuvioForegroundService.ACTION_UPDATE_UPLOAD
-                    putExtra("title", title)
-                    putExtra("content", contentText)
-                    putExtra("percent", pct)
-                }
-                ContextCompat.startForegroundService(host, intent)
+                builder.setProgress(100, pct, false)
             } else {
-                val intent = Intent(host, NuvioForegroundService::class.java).apply {
-                    action = NuvioForegroundService.ACTION_STOP_UPLOAD
-                }
-                host.startService(intent)
-
                 builder.setOngoing(false)
                     .setAutoCancel(true)
                     .setProgress(0, 0, false)
@@ -554,7 +563,6 @@ class NuvioMobilePlugin(private val host: Activity) : Plugin(host) {
                     builder.setContentTitle("Subidas completadas")
                         .setContentText("${args.total} archivos subidos correctamente a Telegram")
                 }
-                notificationManager.notify(UPLOAD_NOTIFICATION_ID, builder.build())
             }
 
             notificationManager.notify(UPLOAD_NOTIFICATION_ID, builder.build())

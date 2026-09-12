@@ -152,6 +152,9 @@ export type TelegramAuthSnapshot = {
   qrLink?: string | null;
   qrSvg?: string | null;
   isPremium: boolean;
+  timeout?: number | null;
+  codeType?: string | null;
+  nextCodeType?: string | null;
 };
 
 export type PreparedUpload = {

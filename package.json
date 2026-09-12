@@ -19,7 +19,8 @@
     "android:setup": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-android.ps1",
     "android:dev": "node scripts/tauri-android.mjs dev",
     "android:build": "node scripts/tauri-android.mjs build --debug --apk --target aarch64",
-    "android:release": "node scripts/tauri-android.mjs build --apk --target aarch64"
+    "android:release": "node scripts/tauri-android.mjs build --apk --target aarch64",
+    "android:google-play": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-google-play.ps1"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
@@ -37,6 +38,7 @@
     "@types/react": "^19.1.8",
     "@types/react-dom": "^19.1.6",
     "@vitejs/plugin-react": "^6.0.2",
+    "playwright": "^1.63.0",
     "typescript": "~6.0.3",
     "vite": "^8.0.16"
   },

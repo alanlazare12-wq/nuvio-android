@@ -38,7 +38,7 @@ impl TelegramService {
         let doc = repo.remote(file_id)?;
         let chat = self.own_chat(repo).await?;
         let e::Message::Message(message) =
-            call(f::get_message(chat, doc.message_id, self.client_id)).await?;
+            call(f::get_message(chat, doc.message_id, self.client_id())).await?;
         let e::MessageContent::MessageDocument(content) = message.content else {
             return Ok(None);
         };
@@ -65,7 +65,7 @@ impl TelegramService {
                 0,
                 0,
                 true,
-                self.client_id,
+                self.client_id(),
             ))
             .await?;
             if file.local.is_downloading_completed {
@@ -134,7 +134,7 @@ impl TelegramService {
 
         let chat = self.own_chat(repo).await?;
         let e::Message::Message(message) =
-            call(f::get_message(chat, doc.message_id, self.client_id)).await?;
+            call(f::get_message(chat, doc.message_id, self.client_id())).await?;
         let e::MessageContent::MessageDocument(content) = message.content else {
             return Err("Este archivo no se puede previsualizar como contenido de Nuvio".into());
         };
@@ -149,12 +149,12 @@ impl TelegramService {
             0,
             prefix,
             false,
-            self.client_id,
+            self.client_id(),
         ))
         .await?;
         let prefix_deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < prefix_deadline {
-            let e::File::File(file) = call(f::get_file(td_file_id, self.client_id)).await?;
+            let e::File::File(file) = call(f::get_file(td_file_id, self.client_id())).await?;
             if file.local.is_downloading_completed || file.local.downloaded_prefix_size >= prefix {
                 break;
             }
@@ -166,13 +166,13 @@ impl TelegramService {
             0,
             0,
             false,
-            self.client_id,
+            self.client_id(),
         ))
         .await?;
 
         let deadline = Instant::now() + Duration::from_secs(3600);
         while Instant::now() < deadline {
-            let e::File::File(file) = call(f::get_file(td_file_id, self.client_id)).await?;
+            let e::File::File(file) = call(f::get_file(td_file_id, self.client_id())).await?;
             if file.local.is_downloading_completed {
                 let source = PathBuf::from(file.local.path);
                 let from_cache = copy_media(&source, &cache_path, &doc.sha256, doc.size)?;

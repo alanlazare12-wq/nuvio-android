@@ -327,18 +327,23 @@ function windowsNoSymlinkFallback(env, tauriResult) {
   console.log(`[Nuvio Android] Incluyendo TDLib nativo: ${tdjsonDestination}`);
 
   const gradleRoot = join(projectRoot, "src-tauri", "gen", "android");
-  const assembleTask = `assemble${targetConfig.gradle}${variant}`;
+  const tasks = [];
+  if (forwardedArgs.includes("--aab")) tasks.push(`bundle${targetConfig.gradle}${variant}`);
+  if (!forwardedArgs.includes("--aab") || forwardedArgs.includes("--apk")) tasks.push(`assemble${targetConfig.gradle}${variant}`);
   const rustTask = `rustBuild${targetConfig.gradle}${variant}`;
   console.log(`[Nuvio Android] Windows no permite symlinks; usando copia segura de ${requestedTarget} y Gradle.`);
 
   return spawnSync(
     "cmd.exe",
-    ["/d", "/s", "/c", "gradlew.bat", "clean", assembleTask, "-x", rustTask],
+    ["/d", "/s", "/c", "gradlew.bat", "clean", ...tasks, "-x", rustTask],
     { cwd: gradleRoot, env, stdio: "inherit", shell: false },
   );
 }
 
 const env = { ...process.env };
+if (process.platform === "win32" && !env.ProgramData) {
+  env.ProgramData = `${env.SystemDrive || "C:"}\\ProgramData`;
+}
 // This override is a Windows DLL SDK, never an Android library.
 delete env.NUVIO_TDLIB_DIR;
 const sdkRoot = detectSdkRoot();

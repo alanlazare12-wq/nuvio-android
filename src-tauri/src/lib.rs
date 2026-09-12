@@ -8,8 +8,11 @@ mod progress;
 mod provider;
 mod repository;
 mod secrets;
+mod startup;
 mod telegram;
 mod transfer;
+#[cfg(any(target_os = "android", test))]
+mod upload_notifications;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -43,8 +46,16 @@ struct AppState {
 }
 
 #[tauri::command]
-async fn get_dashboard(state: State<'_, Arc<AppState>>) -> Result<DashboardData, String> {
-    let state = state.inner().clone();
+async fn get_dashboard(
+    app: tauri::AppHandle,
+    startup: State<'_, startup::Startup>,
+) -> Result<DashboardData, String> {
+    startup.wait(Duration::from_secs(30)).await?;
+    let state = app
+        .try_state::<Arc<AppState>>()
+        .ok_or("No se pudo cargar el estado de Nuvio. Cierra y vuelve a abrir la aplicación.")?
+        .inner()
+        .clone();
     tauri::async_runtime::spawn_blocking(move || dashboard_snapshot(&state))
         .await
         .map_err(|e| e.to_string())?
@@ -300,12 +311,18 @@ async fn prepare_upload(
 }
 
 #[tauri::command]
-async fn sync_files(state: State<'_, Arc<AppState>>) -> Result<usize, String> {
+async fn sync_files(
+    state: State<'_, Arc<AppState>>,
+    full: Option<bool>,
+) -> Result<usize, String> {
     let _guard = state
         .sync_lock
         .try_lock()
         .map_err(|_| "Ya hay una sincronización en curso")?;
-    let result = state.telegram.sync_catalog(&state.repository).await;
+    let result = state
+        .telegram
+        .sync_catalog_options(&state.repository, full.unwrap_or(false))
+        .await;
     *state.background_error.lock().expect("background") = result.as_ref().err().cloned();
     result
 }
@@ -477,6 +494,12 @@ pub fn build_directory_upload_plan(dir_path: &Path) -> Result<DirectoryUploadPla
                 folders_set.insert(rel_path.clone());
                 walk_dir(&path, root, folders_set, files, total_bytes)?;
             } else if metadata.is_file() {
+                if files.len() >= 500 {
+                    return Err(
+                        "La carpeta contiene más de 500 archivos. Para mantener la estabilidad del sistema, sube carpetas más pequeñas o comprímela en un archivo ZIP."
+                            .to_string(),
+                    );
+                }
                 let size = metadata.len();
                 *total_bytes += size;
                 if let Some(parent) = path.parent() {
@@ -972,6 +995,32 @@ async fn run_job(state: Arc<AppState>, job: cloud::WorkItem) {
     }
 }
 
+// Native polling stays alive when Android suspends the WebView. Do not put this
+// in worker(), which awaits catalog synchronization and would stall upload updates.
+#[cfg(target_os = "android")]
+fn notification_worker(state: Arc<AppState>) {
+    let mut uploads = upload_notifications::UploadTracker::default();
+    let mut sync_was_active = false;
+    loop {
+        if let Ok(jobs) = state.repository.list_transfers() {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+            if let Some(notice) = uploads.snapshot(&jobs, now) {
+                if let Err(error) = mobile::update_upload_notification(&serde_json::to_value(notice).unwrap_or_default()) {
+                    eprintln!("Android upload notification: {error}");
+                }
+            }
+        }
+        let sync = state.telegram.sync_progress.lock().expect("sync progress").clone();
+        if sync.active || sync_was_active {
+            if let Err(error) = mobile::update_sync_notification(&serde_json::to_value(&sync).unwrap_or_default()) {
+                eprintln!("Android sync notification: {error}");
+            }
+        }
+        sync_was_active = sync.active;
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
 async fn worker(state: Arc<AppState>) {
     let settings = state.repository.settings().unwrap_or_default();
     if let Err(error) = state.telegram.initialize(settings.remember_session).await {
@@ -1136,6 +1185,19 @@ async fn telegram_submit_phone(
     state.telegram.submit_phone(phone).await
 }
 #[tauri::command]
+async fn telegram_submit_phone_sms(
+    state: State<'_, Arc<AppState>>,
+    phone: String,
+) -> Result<TelegramAuthSnapshot, String> {
+    state.telegram.submit_phone_sms(phone).await
+}
+#[tauri::command]
+async fn telegram_reset_to_phone(
+    state: State<'_, Arc<AppState>>,
+) -> Result<TelegramAuthSnapshot, String> {
+    state.telegram.reset_to_phone().await
+}
+#[tauri::command]
 async fn telegram_submit_email(
     state: State<'_, Arc<AppState>>,
     email: String,
@@ -1221,53 +1283,80 @@ fn directory_size(path: &Path) -> std::io::Result<u64> {
     Ok(total)
 }
 
+// Keystore calls wait for Android callbacks; never run this on the setup/event-loop thread.
+fn initialize_state(app: &tauri::AppHandle) -> Result<Arc<AppState>, String> {
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("unable to resolve app data directory: {error}"))?;
+    fs::create_dir_all(&app_data_dir)
+        .map_err(|error| format!("unable to create app data directory: {error}"))?;
+    let staging_dir = app_data_dir.join("staging");
+    let media_cache_dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| format!("unable to resolve app cache directory: {error}"))?
+        .join("media");
+    fs::create_dir_all(&staging_dir).map_err(|error| error.to_string())?;
+    fs::create_dir_all(&media_cache_dir).map_err(|error| error.to_string())?;
+
+    let repository = CatalogRepository::open(&app_data_dir.join("nuvio.db"))
+        .map_err(|error| error.to_string())?;
+    repository.init_cloud().map_err(|error| error.to_string())?;
+    let settings = repository.settings().map_err(|e| e.to_string())?;
+    let telegram = TelegramService::new(&app_data_dir)?;
+    let state = Arc::new(AppState {
+        repository,
+        telegram,
+        staging_dir,
+        media_cache_dir,
+        preparation_slots: Arc::new(tokio::sync::Semaphore::new(
+            settings.preparation_concurrency,
+        )),
+        cache_usage: Mutex::new((std::time::Instant::now() - Duration::from_secs(31), 0)),
+        upload_slots: Arc::new(tokio::sync::Semaphore::new(16)),
+        download_slots: Arc::new(tokio::sync::Semaphore::new(settings.download_concurrency)),
+        sync_lock: tokio::sync::Mutex::new(()),
+        background_error: Mutex::new(None),
+    });
+    Ok(state)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(startup::Startup::default())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(mobile::init())
         .setup(|app| {
-            let app_data_dir = app
-                .path()
-                .app_data_dir()
-                .map_err(|error| format!("unable to resolve app data directory: {error}"))?;
-            fs::create_dir_all(&app_data_dir)
-                .map_err(|error| format!("unable to create app data directory: {error}"))?;
-            let staging_dir = app_data_dir.join("staging");
-            let media_cache_dir = app
-                .path()
-                .app_cache_dir()
-                .map_err(|error| format!("unable to resolve app cache directory: {error}"))?
-                .join("media");
-            fs::create_dir_all(&staging_dir).map_err(|error| error.to_string())?;
-            fs::create_dir_all(&media_cache_dir).map_err(|error| error.to_string())?;
-
-            let repository = CatalogRepository::open(&app_data_dir.join("nuvio.db"))
-                .map_err(|error| error.to_string())?;
-            repository.init_cloud()?;
-            let settings = repository.settings().map_err(|e| e.to_string())?;
-            let telegram = TelegramService::new(&app_data_dir)?;
-            let state = Arc::new(AppState {
-                repository,
-                telegram,
-                staging_dir,
-                media_cache_dir,
-                preparation_slots: Arc::new(tokio::sync::Semaphore::new(
-                    settings.preparation_concurrency,
-                )),
-                cache_usage: Mutex::new((std::time::Instant::now() - Duration::from_secs(31), 0)),
-                upload_slots: Arc::new(tokio::sync::Semaphore::new(16)),
-                download_slots: Arc::new(tokio::sync::Semaphore::new(
-                    settings.download_concurrency,
-                )),
-                sync_lock: tokio::sync::Mutex::new(()),
-                background_error: Mutex::new(None),
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let initializer = handle.clone();
+                let _ = mobile::update_sync_notification(&serde_json::json!({"active": true, "phase": "startup", "scanned": 0}));
+                let result = tauri::async_runtime::spawn_blocking(move || initialize_state(&initializer))
+                    .await
+                    .map_err(|error| format!("No se pudo iniciar Nuvio: {error}"))
+                    .and_then(|result| result);
+                let _ = mobile::update_sync_notification(&serde_json::json!({"active": false, "phase": "startup", "scanned": 0}));
+                match result {
+                    Ok(state) => {
+                        handle.manage(state.clone());
+                        handle.state::<startup::Startup>().finish(Ok(()));
+                        #[cfg(target_os = "android")]
+                        {
+                            let notifications = state.clone();
+                            tauri::async_runtime::spawn_blocking(move || notification_worker(notifications));
+                        }
+                        tauri::async_runtime::spawn(worker(state));
+                    }
+                    Err(error) => handle.state::<startup::Startup>().finish(Err(format!(
+                        "No se pudo preparar el almacenamiento de Nuvio: {error}. Cierra y vuelve a abrir la aplicación."
+                    ))),
+                }
             });
-            app.manage(state.clone());
-            tauri::async_runtime::spawn(worker(state));
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -1319,6 +1408,8 @@ pub fn run() {
             telegram_auth_state,
             telegram_configure,
             telegram_submit_phone,
+            telegram_submit_phone_sms,
+            telegram_reset_to_phone,
             telegram_submit_email,
             telegram_submit_email_code,
             telegram_submit_code,
@@ -1414,5 +1505,19 @@ mod tests {
         let file_path = temp.path().join("file.txt");
         fs::write(&file_path, b"not a dir").unwrap();
         assert!(build_directory_upload_plan(&file_path).is_err());
+    }
+
+    #[test]
+    fn test_build_directory_upload_plan_rejects_more_than_500_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("many_files");
+        fs::create_dir_all(&root).unwrap();
+        for i in 0..501 {
+            fs::write(root.join(format!("f_{i}.txt")), b"x").unwrap();
+        }
+        let result = build_directory_upload_plan(&root);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("500 archivos"));
     }
 }

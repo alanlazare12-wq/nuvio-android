@@ -92,8 +92,8 @@ export async function setFavorite(id: string, favorite: boolean): Promise<void> 
   await invoke("set_favorite", { id, favorite });
 }
 
-export function syncFiles(): Promise<number> {
-  return invoke("sync_files");
+export function syncFiles(full = false): Promise<number> {
+  return invoke("sync_files", { full });
 }
 
 export function createFolder(name: string, parentId?: string | null): Promise<string> {
@@ -209,6 +209,9 @@ export async function downloadFile(file: CloudFile): Promise<boolean> {
   const results = await queueDownloads([file.id], directory);
   return results.some((item) => item.status === "queued");
 }
+
+export const MAX_UPLOAD_BATCH_MOBILE = 250;
+export const MAX_UPLOAD_BATCH_DESKTOP = 500;
 
 export async function selectFilesForUpload(): Promise<string[]> {
   if ((await getPlatform()) === "android") {
@@ -340,6 +343,14 @@ export function submitTelegramPhone(phone: string): Promise<TelegramAuthSnapshot
   return invoke<TelegramAuthSnapshot>("telegram_submit_phone", { phone });
 }
 
+export function submitTelegramPhoneSms(phone: string): Promise<TelegramAuthSnapshot> {
+  return invoke<TelegramAuthSnapshot>("telegram_submit_phone_sms", { phone });
+}
+
+export function resetTelegramToPhone(): Promise<TelegramAuthSnapshot> {
+  return invoke<TelegramAuthSnapshot>("telegram_reset_to_phone");
+}
+
 export function submitTelegramEmail(email: string): Promise<TelegramAuthSnapshot> {
   return invoke<TelegramAuthSnapshot>("telegram_submit_email", { email });
 }
@@ -380,14 +391,26 @@ export function forgetTelegramSession(): Promise<TelegramAuthSnapshot> {
 }
 
 export function readableError(value: unknown): string {
-  if (typeof value === "string" && value.trim()) return value;
-  if (value instanceof Error && value.message.trim()) return value.message;
-  try {
-    const message = JSON.stringify(value);
-    return message && message !== "null" && message !== '""' ? message : "Ocurrió un error inesperado";
-  } catch {
-    return "Ocurrió un error inesperado";
+  let str = "";
+  if (typeof value === "string" && value.trim()) str = value;
+  else if (value instanceof Error && value.message.trim()) str = value.message;
+  else {
+    try {
+      const message = JSON.stringify(value);
+      str = message && message !== "null" && message !== '""' ? message : "Ocurrió un error inesperado";
+    } catch {
+      str = "Ocurrió un error inesperado";
+    }
   }
+
+  const lower = str.toLowerCase();
+  if (lower.includes("can't be resend") || lower.includes("cannot be resend") || lower.includes("can't be resent")) {
+    return "Telegram requiere esperar a que finalice la cuenta regresiva antes de solicitar el código por SMS o llamada telefónica.";
+  }
+  if (lower.includes("phone_code_expired")) {
+    return "El código de verificación ha expirado. Solicita un nuevo código o reenvío.";
+  }
+  return str;
 }
 
 export async function prepareZipUploads(items: { path: string; name?: string }[], folderId: string | null | undefined, onProgress: (processed: number, total: number, name: string) => void): Promise<PreparedUploadResult[]> {

@@ -11,7 +11,7 @@ const browser = await chromium.launch({ channel: process.env.QA_BROWSER_CHANNEL 
 const output = path.resolve("qa");
 await mkdir(output, { recursive: true });
 const results = [];
-const url = process.env.QA_BASE_URL || "http://127.0.0.1:1420";
+const url = process.env.QA_BASE_URL || "http://localhost:1420";
 
 async function setup(viewport = { width: 1280, height: 820 }) {
   const context = await browser.newContext({ viewport, hasTouch: viewport.width < 600, isMobile: viewport.width < 600 });
@@ -60,13 +60,44 @@ async function setup(viewport = { width: 1280, height: 820 }) {
         if (cmd === "set_favorite") { qa.files.find(file => file.id === args.id).favorite = args.favorite; return; }
         if (cmd === "prepare_media") return new Promise(resolve => { qa.media[args.id] = resolve; });
         if (cmd === "prepare_thumbnail") return qa.thumbnails?.[args.id] ?? null;
-        if (cmd === "telegram_auth_state") return { stage: "needsCredentials", connected: false, message: "Configura tus credenciales", isPremium: false };
+        if (cmd === "telegram_auth_state") return qa.telegramAuthState ?? { stage: "needsCredentials", connected: false, message: "Configura tus credenciales", isPremium: false };
+        if (cmd === "telegram_configure") {
+          qa.telegramAuthState = { stage: "phone", connected: false, message: "Ingresa el teléfono", isPremium: false };
+          return qa.telegramAuthState;
+        }
+        if (cmd === "telegram_submit_phone") {
+          qa.telegramAuthState = { stage: "code", connected: false, message: "Ingresa el código", hint: "Código en app oficial de Telegram", isPremium: false, timeout: 60, codeType: "telegram", nextCodeType: "sms" };
+          return qa.telegramAuthState;
+        }
+        if (cmd === "telegram_submit_phone_sms") {
+          qa.telegramAuthState = { stage: "code", connected: false, message: "Ingresa el código", hint: "Código en app oficial de Telegram", isPremium: false, timeout: 60, codeType: "telegram", nextCodeType: "sms" };
+          return qa.telegramAuthState;
+        }
+        if (cmd === "telegram_resend_code") {
+          qa.telegramAuthState = { stage: "code", connected: false, message: "Ingresa el código", hint: "Código por SMS a tu celular", isPremium: false, timeout: 60, codeType: "sms", nextCodeType: "call" };
+          return qa.telegramAuthState;
+        }
+        if (cmd === "telegram_submit_email") {
+          qa.telegramAuthState = { stage: "emailCode", connected: false, message: "Ingresa el código enviado al correo", hint: "Revisa tu correo", isPremium: false };
+          return qa.telegramAuthState;
+        }
+        if (cmd === "telegram_request_qr") {
+          qa.telegramAuthState = { stage: "qr", connected: false, message: "Escanea desde Telegram", qrSvg: '<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200"><rect width="200" height="200" fill="black"/></svg>', isPremium: false };
+          return qa.telegramAuthState;
+        }
+        if (cmd === "telegram_reset_to_phone") {
+          qa.telegramAuthState = { stage: "phone", connected: false, message: "Ingresa el teléfono", isPremium: false };
+          return qa.telegramAuthState;
+        }
         if (cmd === "plugin:dialog|open") return qa.uploadPaths ?? null;
         if (cmd === "plugin:event|listen") return 1;
         if (cmd === "plugin:event|unlisten") return;
         if (cmd === "prepare_zip_uploads") {
           if (qa.zipError) throw qa.zipError;
           return [{ Ok: { transferId: "zip-qa", fileName: "Nuvio-001.zip", localPath: "zip-qa.zip", sizeBytes: 100, sha256: "qa", duplicate: false, encrypted: false, status: "ready" } }];
+        }
+        if (cmd === "sync_files") {
+          return qa.syncResultCount ?? 0;
         }
         if (cmd.startsWith("plugin:notification|")) return false;
         throw new Error(`Unexpected IPC call in QA: ${cmd}`);
@@ -331,6 +362,95 @@ try {
     await expect(page.getByRole("alert")).toContainText("2147483647");
     assert.equal(await page.evaluate(() => window.__qa.calls.some(call => call.cmd === "telegram_configure")), false);
   }, { width: 844, height: 390 });
+  await test("batch-upload-limit-protection-desktop", async page => {
+    await page.evaluate(() => {
+      window.__qa.uploadPaths = Array.from({ length: 501 }, (_, i) => `C:/Uploads/file-${i}.txt`);
+    });
+    await page.getByRole("button", { name: "Subir", exact: true }).click();
+    await expect(page.getByText(/Has seleccionado 501 archivos.*límite máximo por lote es de 500/)).toBeVisible();
+    const prepareCalls = await page.evaluate(() => window.__qa.calls.filter(c => c.cmd === "prepare_upload" || c.cmd === "prepare_zip_uploads"));
+    assert.equal(prepareCalls.length, 0, "No upload preparation must happen when exceeding safe limit");
+  });
+  await test("incremental-and-full-sync-actions", async page => {
+    await page.evaluate(() => { window.__qa.syncResultCount = 0; });
+    const syncButton = page.getByRole("button", { name: "Sincronizar", exact: true });
+    await syncButton.click();
+    await expect(page.getByText("Tu catálogo ya está al día con la nube.")).toBeVisible();
+    let syncCalls = await page.evaluate(() => window.__qa.calls.filter(c => c.cmd === "sync_files"));
+    assert.deepEqual(syncCalls[syncCalls.length - 1].args, { full: false });
+
+    await page.evaluate(() => { window.__qa.syncResultCount = 3; });
+    await syncButton.click();
+    await expect(page.getByText("3 archivos nuevos sincronizados.")).toBeVisible();
+
+    await page.evaluate(() => { window.__qa.syncResultCount = 4; });
+    await syncButton.click({ button: "right" });
+    await expect(page.getByText("Sincronización completa: 4 archivos procesados.")).toBeVisible();
+    syncCalls = await page.evaluate(() => window.__qa.calls.filter(c => c.cmd === "sync_files"));
+    assert.deepEqual(syncCalls[syncCalls.length - 1].args, { full: true });
+  });
+  await test("telegram-auth-options-and-reset", async page => {
+    await page.evaluate(() => {
+      window.__qa.telegramAuthState = { stage: "phone", connected: false, message: "Ingresa el teléfono", isPremium: false };
+    });
+    const profileBtn = page.locator(".profile-button");
+    await profileBtn.click();
+    await expect(page.getByRole("dialog")).toBeVisible();
+
+    // Verify all 4 tabs exist
+    const tabs = page.locator(".auth-method-tab");
+    await expect(tabs).toHaveCount(4);
+    await expect(page.getByRole("tab", { name: /App Telegram/ })).toBeVisible();
+    await expect(page.getByRole("tab", { name: /SMS directo/ })).toBeVisible();
+    await expect(page.getByRole("tab", { name: /Código QR/ })).toBeVisible();
+    await expect(page.getByRole("tab", { name: /Correo/ })).toBeVisible();
+
+    // Switch to SMS directo
+    await page.getByRole("tab", { name: /SMS directo/ }).click();
+    await expect(page.getByText(/mensaje de texto SMS tradicional directamente a tu celular/)).toBeVisible();
+    const smsInput = page.locator("#telegram-phone-sms");
+    await smsInput.fill("+521234567890");
+    await page.getByRole("button", { name: /Enviar código por SMS directo/ }).click();
+
+    // Verify code stage reached and cooldown container is displayed
+    await expect(page.getByLabel("Código de verificación")).toBeVisible();
+    await expect(page.locator(".auth-cooldown-container")).toBeVisible();
+    await expect(page.getByText(/Podrás solicitar código por SMS en/)).toBeVisible();
+    let calls = await page.evaluate(() => window.__qa.calls.filter(c => c.cmd === "telegram_submit_phone_sms"));
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].args.phone, "+521234567890");
+
+    // Click back to options button
+    const backBtn = page.getByRole("button", { name: /Volver a elegir método/ });
+    await expect(backBtn).toBeVisible();
+    await backBtn.click();
+
+    // Verify back in options with 4 tabs
+    await expect(page.locator(".auth-methods-nav")).toBeVisible();
+    calls = await page.evaluate(() => window.__qa.calls.filter(c => c.cmd === "telegram_reset_to_phone"));
+    assert.equal(calls.length, 1);
+
+    // Switch to QR tab
+    await page.getByRole("tab", { name: /Código QR/ }).click();
+    await expect(page.locator(".auth-qr")).toBeVisible();
+
+    // Switch to Correo tab
+    await page.getByRole("tab", { name: /Correo/ }).click();
+    await expect(page.getByText(/Para cuentas de Telegram que tengan configurado inicio de sesión mediante correo/)).toBeVisible();
+    const emailInput = page.locator("#telegram-email");
+    await emailInput.fill("usuario@ejemplo.com");
+    await page.getByRole("button", { name: /Enviar código al correo/ }).click();
+
+    // Verify emailCode stage reached
+    await expect(page.getByLabel("Código de correo")).toBeVisible();
+    calls = await page.evaluate(() => window.__qa.calls.filter(c => c.cmd === "telegram_submit_email"));
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].args.email, "usuario@ejemplo.com");
+
+    // Close modal
+    await page.locator(".modal-close").click();
+    await expect(page.getByRole("dialog")).toHaveCount(0);
+  });
   for (const width of [390, 768, 1280]) {
     await test(`layout-${width}`, async page => {
       const overflow = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth);

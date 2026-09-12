@@ -61,6 +61,7 @@ impl CatalogRepository {
             CREATE INDEX IF NOT EXISTS idx_files_kind ON files(kind);
             CREATE INDEX IF NOT EXISTS idx_files_favorite ON files(favorite);
             CREATE INDEX IF NOT EXISTS idx_files_trashed ON files(trashed);
+            CREATE INDEX IF NOT EXISTS idx_files_telegram_message_id ON files(telegram_message_id);
 
             CREATE TABLE IF NOT EXISTS folders (
                 id TEXT PRIMARY KEY NOT NULL,
@@ -229,6 +230,15 @@ impl CatalogRepository {
             files.push(row?);
         }
         Ok(files)
+    }
+
+    pub fn max_telegram_message_id(&self) -> Result<Option<i64>, RepositoryError> {
+        let connection = self.connection.lock().expect("catalog mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT MAX(CAST(telegram_message_id AS INTEGER)) FROM files WHERE telegram_message_id IS NOT NULL AND telegram_message_id != ''",
+        )?;
+        let max_id: Option<i64> = statement.query_row([], |row| row.get(0))?;
+        Ok(max_id)
     }
 
     pub fn list_folders(&self) -> Result<Vec<CloudFolder>, RepositoryError> {
@@ -1313,5 +1323,33 @@ mod tests {
                 .upload_concurrency,
             4
         );
+    }
+    #[test]
+    fn max_telegram_message_id_returns_correct_max_or_none() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("db");
+        let repo = CatalogRepository::open(&path).unwrap();
+        repo.init_cloud().unwrap();
+        assert_eq!(repo.max_telegram_message_id().unwrap(), None);
+
+        repo.connection
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO files (id, name, extension, kind, size_bytes, updated_at, telegram_message_id)
+                 VALUES ('tg-100', 'a.txt', 'txt', 'document', 10, '2026-01-01T00:00:00Z', '100'),
+                        ('tg-550', 'b.txt', 'txt', 'document', 10, '2026-01-01T00:00:00Z', '550'),
+                        ('tg-empty', 'd.txt', 'txt', 'document', 10, '2026-01-01T00:00:00Z', ''),
+                        ('tg-null', 'e.txt', 'txt', 'document', 10, '2026-01-01T00:00:00Z', NULL),
+                        ('tg-25', 'c.txt', 'txt', 'document', 10, '2026-01-01T00:00:00Z', '25')",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(repo.max_telegram_message_id().unwrap(), Some(550));
+
+        // When the highest file is deleted permanently, max should reflect the remaining highest
+        repo.remove_catalog_files(&["tg-550".to_string()]).unwrap();
+        assert_eq!(repo.max_telegram_message_id().unwrap(), Some(100));
     }
 }

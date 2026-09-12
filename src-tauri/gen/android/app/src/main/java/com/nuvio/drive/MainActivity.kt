@@ -39,18 +39,4 @@ class MainActivity : TauriActivity() {
     })
   }
 
-  override fun onPause() {
-    super.onPause()
-    if (NuvioForegroundService.isWorking) {
-      appWebView?.onResume()
-    }
-  }
-
-  override fun onStop() {
-    super.onStop()
-    if (NuvioForegroundService.isWorking) {
-      appWebView?.onResume()
-    }
-  }
 }
-

@@ -693,10 +693,10 @@ impl TelegramService {
         if !self.refresh().await?.connected {
             return Err("Conecta tu cuenta de Telegram primero".into());
         }
-        let e::User::User(me) = call(f::get_me(self.client_id)).await?;
+        let e::User::User(me) = call(f::get_me(self.client_id())).await?;
         repo.bind_account(me.id)?;
         let e::Chat::Chat(chat) =
-            call(f::create_private_chat(me.id, false, self.client_id)).await?;
+            call(f::create_private_chat(me.id, false, self.client_id())).await?;
         Ok(chat.id)
     }
 
@@ -715,7 +715,7 @@ impl TelegramService {
             None,
             None,
             content,
-            self.client_id,
+            self.client_id(),
         ))
         .await?;
         if message.sending_state.is_none() {
@@ -849,17 +849,18 @@ impl TelegramService {
     }
 
     pub async fn sync_catalog(&self, repo: &CatalogRepository) -> Result<usize, String> {
+        self.sync_catalog_options(repo, false).await
+    }
+
+    pub async fn sync_catalog_options(
+        &self,
+        repo: &CatalogRepository,
+        force_full: bool,
+    ) -> Result<usize, String> {
         let _gate = self.catalog_sync_gate.lock().await;
         let mut progress = crate::progress::SyncRun::new(&self.sync_progress);
-        let result = self.sync_catalog_inner(repo, &progress).await;
+        let result = self.sync_catalog_inner(repo, &progress, force_full).await;
         progress.finish(result.as_ref().err().cloned());
-        if let Err(ref err) = result {
-            let _ = crate::mobile::update_sync_notification(&serde_json::json!({
-                "active": false,
-                "error": err,
-                "phase": "error"
-            }));
-        }
         result
     }
 
@@ -867,43 +868,40 @@ impl TelegramService {
         &self,
         repo: &CatalogRepository,
         progress: &crate::progress::SyncRun<'_>,
+        force_full: bool,
     ) -> Result<usize, String> {
         let chat = self.own_chat(repo).await?;
-        let total = match tokio::time::timeout(
-            Duration::from_secs(5),
-            call(f::get_chat_message_count(
-                chat,
-                None,
-                e::SearchMessagesFilter::Empty,
-                false,
-                self.client_id,
-            )),
-        )
-        .await
-        {
-            Ok(Ok(e::Count::Count(count))) => usize::try_from(count.count).ok(),
-            _ => None,
+        let max_known_id = if force_full {
+            None
+        } else {
+            repo.max_telegram_message_id().unwrap_or(None)
+        };
+        let is_incremental = max_known_id.is_some();
+        let total = if is_incremental {
+            None
+        } else {
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                call(f::get_chat_message_count(
+                    chat,
+                    None,
+                    e::SearchMessagesFilter::Empty,
+                    false,
+                    self.client_id(),
+                )),
+            )
+            .await
+            {
+                Ok(Ok(e::Count::Count(count))) => usize::try_from(count.count).ok(),
+                _ => None,
+            }
         };
         let mut scanned = 0;
         progress.scanned(scanned, total);
-        let _ = crate::mobile::update_sync_notification(&serde_json::json!({
-            "active": true,
-            "scanned": scanned,
-            "total": total,
-            "percent": null,
-            "phase": "scanning"
-        }));
         let mut latest_folder_events = std::collections::HashMap::<String, FolderEvent>::new();
         let mut latest_moves = std::collections::HashMap::<i64, Option<String>>::new();
 
         // 1. CARGAR CARPETAS Y MOVIMIENTOS PRIMERO
-        let _ = crate::mobile::update_sync_notification(&serde_json::json!({
-            "active": true,
-            "scanned": 0,
-            "total": total,
-            "percent": 5,
-            "phase": "folders"
-        }));
 
         let mut from_msg = 0;
         while let Ok(e::FoundChatMessages::FoundChatMessages(page)) = call(f::search_chat_messages(
@@ -915,7 +913,7 @@ impl TelegramService {
             0,
             100,
             None,
-            self.client_id,
+            self.client_id(),
         )).await {
             let mut last_id = from_msg;
             let mut found = false;
@@ -941,7 +939,7 @@ impl TelegramService {
             0,
             100,
             None,
-            self.client_id,
+            self.client_id(),
         )).await {
             let mut last_id = from_msg;
             let mut found = false;
@@ -967,6 +965,7 @@ impl TelegramService {
         let mut total_documents = 0usize;
         let mut pending_documents = Vec::new();
         let mut last_flush = Instant::now();
+        let mut reached_known_history = false;
 
         // 2. SINCRONIZAR ARCHIVOS E IMÁGENES EN SUS CARPETAS CORRESPONDIENTES
         loop {
@@ -976,7 +975,7 @@ impl TelegramService {
                 0,
                 100,
                 false,
-                self.client_id,
+                self.client_id(),
             ))
             .await?;
             let mut last = cursor;
@@ -985,6 +984,12 @@ impl TelegramService {
             for msg in page.messages.into_iter().flatten() {
                 if msg.id == cursor {
                     continue;
+                }
+                if let Some(max_id) = max_known_id {
+                    if msg.id <= max_id {
+                        reached_known_history = true;
+                        break;
+                    }
                 }
                 found = true;
                 scanned += 1;
@@ -1024,15 +1029,7 @@ impl TelegramService {
                 last_flush = Instant::now();
             }
             progress.scanned(scanned, total);
-            let percent = total.filter(|n| *n > 0).map(|n| ((scanned as f64 / n as f64 * 90.0) as u8).min(89));
-            let _ = crate::mobile::update_sync_notification(&serde_json::json!({
-                "active": true,
-                "scanned": scanned,
-                "total": total,
-                "percent": percent,
-                "phase": "files"
-            }));
-            if !found || last == cursor {
+            if !found || last == cursor || reached_known_history {
                 break;
             }
             cursor = last;
@@ -1051,13 +1048,6 @@ impl TelegramService {
         repo.reconcile_moves_and_orphans(&latest_moves)?;
 
         progress.applying(total_documents, total_documents.max(1));
-        let _ = crate::mobile::update_sync_notification(&serde_json::json!({
-            "active": false,
-            "scanned": scanned,
-            "total": total,
-            "percent": 100,
-            "phase": "complete"
-        }));
         Ok(total_documents)
     }
 
@@ -1097,7 +1087,7 @@ impl TelegramService {
             message_ids.push(repo.remote(id)?.message_id);
         }
         let chat = self.own_chat(repo).await?;
-        call(f::delete_messages(chat, message_ids, true, self.client_id)).await?;
+        call(f::delete_messages(chat, message_ids, true, self.client_id())).await?;
         repo.remove_catalog_files(&unique_ids)
             .map_err(|e| e.to_string())
     }
@@ -1165,7 +1155,7 @@ impl TelegramService {
                 None,
                 None,
                 content,
-                self.client_id,
+                self.client_id(),
             ))
             .await;
             let e::Message::Message(message) = match send_result {
@@ -1196,7 +1186,7 @@ impl TelegramService {
                         chat,
                         vec![pending],
                         true,
-                        self.client_id,
+                        self.client_id(),
                     ))
                     .await;
                 }
@@ -1229,7 +1219,7 @@ impl TelegramService {
                 }
             }
 
-            match call(f::get_message(chat, pending, self.client_id)).await {
+            match call(f::get_message(chat, pending, self.client_id())).await {
                 Ok(e::Message::Message(message)) => {
                     if let Some(doc) = document(&message) {
                         repo.record_remote(&doc).map_err(|e| e.to_string())?;
@@ -1241,7 +1231,7 @@ impl TelegramService {
                     }
                     if let e::MessageContent::MessageDocument(content) = message.content {
                         if let Ok(e::File::File(file)) =
-                            call(f::get_file(content.document.document.id, self.client_id)).await
+                            call(f::get_file(content.document.document.id, self.client_id())).await
                         {
                             repo.set_td_file_id(&job.id, file.id)
                                 .map_err(|e| e.to_string())?;
@@ -1298,21 +1288,21 @@ impl TelegramService {
         let chat = self.own_chat(repo).await?;
         let message_id = job.pending.ok_or("Falta la referencia de Telegram")?;
         let e::Message::Message(message) =
-            call(f::get_message(chat, message_id, self.client_id)).await?;
+            call(f::get_message(chat, message_id, self.client_id())).await?;
         let e::MessageContent::MessageDocument(content) = message.content else {
             return Err("El mensaje ya no contiene el archivo".into());
         };
         let file_id = content.document.document.id;
         repo.set_td_file_id(&job.id, file_id)
             .map_err(|e| e.to_string())?;
-        call(f::download_file(file_id, 16, 0, 0, false, self.client_id)).await?;
+        call(f::download_file(file_id, 16, 0, 0, false, self.client_id())).await?;
         let deadline = Instant::now() + Duration::from_secs(3600);
         let mut estimator = SpeedEstimator::new(0);
 
         while Instant::now() < deadline {
             let control = repo.transfer_control(&job.id).map_err(|e| e.to_string())?;
             if control.pause_requested || control.cancel_requested {
-                let _ = call(f::cancel_download_file(file_id, false, self.client_id)).await;
+                let _ = call(f::cancel_download_file(file_id, false, self.client_id())).await;
                 if control.cancel_requested {
                     repo.mark_cancelled(&job.id).map_err(|e| e.to_string())?;
                 } else {
@@ -1321,7 +1311,7 @@ impl TelegramService {
                 return Ok(());
             }
 
-            let e::File::File(file) = call(f::get_file(file_id, self.client_id)).await?;
+            let e::File::File(file) = call(f::get_file(file_id, self.client_id())).await?;
             if file.local.is_downloading_completed {
                 repo.update_runtime(
                     &job.id,

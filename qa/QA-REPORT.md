@@ -47,3 +47,43 @@ Las funciones de cifrado local generan `NUVIO02` y leen archivos antiguos `NUVIO
 El código original de `src`, `src-tauri/src` y `package.json` se conservó en `baseline-before-qa.zip`. En ese archivo ZIP, los archivos Rust aparecen bajo `src/` y deben restaurarse en `src-tauri/src/`; es una copia de respaldo de fuentes, no un instalador. `ui-baseline-results.json` conserva la primera ejecución de interfaz. Los archivos nuevos y las instrucciones para repetir las comprobaciones están documentados en el README.
 
 Estas comprobaciones cubren los casos enumerados; no constituyen una garantía de ausencia de errores en flujos que requieren el entorno nativo o Telegram real.
+
+---
+
+# Revisión QA Experta — Protección contra Selección Masiva y Sincronización Incremental (12 de septiembre de 2026)
+
+Se realizó una auditoría completa de QA sobre las dos nuevas funciones del sistema en Android y Escritorio:
+
+### 1. Funcionalidades evaluadas y comportamiento verificado
+
+| Módulo | Escenario de prueba | Comportamiento verificado | Estado |
+| :--- | :--- | :--- | :---: |
+| **Protección Masiva (Android)** | Selección de >250 archivos vía selector nativo (`NuvioMobilePlugin.kt`) | Rechazo inmediato antes de staging en flash (`cacheDir/upload_staging`). Evita saturación de Binder (1 MB) y Android LMK watchdog (`kill -9`). | **Aprobado** |
+| **Protección Masiva (Android)** | Selección de carpetas con >250 archivos en subdirectorios (`uploadDirectoryPicked`) | Validación temprana durante el recorrido de `DocumentFile`. Si supera 250, aborta y notifica al usuario sin bloquear I/O ni memoria. | **Aprobado** |
+| **Protección Masiva (Desktop)** | Selección >500 archivos en selector o arrastre externo (`App.tsx`) | Validación antes de invocar IPC (`prepare_upload` / `prepare_zip_uploads`). Muestra aviso de lote seguro y sugiere compresión ZIP. | **Aprobado** |
+| **Protección Masiva (Backend)** | Plan de subida de carpetas >500 archivos (`build_directory_upload_plan` en `lib.rs`) | Rechazo con `Err` descriptivo a nivel Rust si el conteo recursivo excede 500 archivos. | **Aprobado** |
+| **Sincronización Incremental** | Catálogo local ya sincronizado (sin cambios remotos) | Consulta instantánea a `max_telegram_message_id()`. Paginación de `get_chat_history` se detiene en el 1.er lote (~50 ms). Reporta: "Tu catálogo ya está al día con la nube." | **Aprobado** |
+| **Sincronización Incremental** | Detección de nuevos archivos subidos desde otro dispositivo | Paginación se detiene al alcanzar el mensaje `<= max_known_id`. Solo indexa el diferencial y notifica: *"X archivo(s) nuevo(s) sincronizado(s)."* | **Aprobado** |
+| **Sincronización Completa** | Forzado manual por clic derecho (`onContextMenu` en botón Sync) | Envía `{ full: true }` a `sync_files`, ignorando el corte anticipado para auditoría profunda. | **Aprobado** |
+
+### 2. Matriz de Ejecución Automatizada
+
+1. **Pruebas Unitarias de Rust (`cargo test --manifest-path src-tauri/Cargo.toml --lib`):**
+   * **60 pruebas ejecutadas, 60 aprobadas, 0 fallidas, 0 ignoradas.**
+   * Nuevas pruebas verificadas:
+     * `repository::tests::max_telegram_message_id_returns_correct_max_or_none`: Valida el cálculo de ID máximo sobre SQLite, consistencia tras borrado e inicialización adecuada de tablas remotas.
+     * `tests::test_build_directory_upload_plan_rejects_more_than_500_files`: Valida que el backend rechace planes de directorios que excedan el límite de seguridad de 500 archivos.
+2. **Análisis Estático con Clippy (`cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings`):**
+   * **0 advertencias, 0 errores.** Cumplimiento total de directrices Rust para todos los targets del workspace.
+3. **Comprobación de Tipos TypeScript (`pnpm run check` -> `tsc --noEmit`):**
+   * **0 errores.** Tipado estricto en puentes, componentes y utilidades.
+4. **Compilación de Producción Frontend (`pnpm run build` -> `tsc && vite build`):**
+   * **Exitoso.** 1677 módulos transformados, generación de bundles minificados sin errores.
+5. **Suite de UI Automatizada Playwright (`pnpm run qa:ui`):**
+   * **26 pruebas ejecutadas, 26 aprobadas, 0 fallidas.**
+   * Nuevas pruebas añadidas a la suite permanente:
+     * `batch-upload-limit-protection-desktop`: Comprueba que 501 archivos seleccionados bloqueen la preparación y muestren el aviso correspondiente sin llamadas espurias al backend.
+     * `incremental-and-full-sync-actions`: Comprueba el flujo incremental (`full: false`) con 0 y 3 archivos, y el forzado con clic derecho (`full: true`) verificando parámetros y notificaciones.
+6. **Compilación Nativa Android Kotlin (`./gradlew.bat :app:compileUniversalReleaseKotlin`):**
+   * **BUILD SUCCESSFUL en 1m 54s, 83 tareas ejecutadas.**
+   * Verificación sin errores de sintaxis, concurrencia o tipos en `NuvioMobilePlugin.kt`.
