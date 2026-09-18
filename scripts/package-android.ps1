@@ -1,6 +1,7 @@
-param([ValidateSet('aarch64')][string]$Target = 'aarch64', [switch]$VerifyOnly)
+param([ValidateSet('aarch64')][string]$Target = 'aarch64', [switch]$VerifyOnly, [switch]$ReuseBuiltRust)
 $ErrorActionPreference = 'Stop'
 $project = Split-Path -Parent $PSScriptRoot
+$expectedVersion = (Get-Content -LiteralPath (Join-Path $project 'package.json') -Raw | ConvertFrom-Json).version
 $signing = Join-Path $project '.release-signing'
 $keystore = Join-Path $signing 'nuvio-android.jks'
 $passwordFile = Join-Path $signing 'android-password.txt'
@@ -33,8 +34,69 @@ try {
     if (-not $VerifyOnly) {
         Push-Location $project
         try {
-            & node scripts/tauri-android.mjs build --apk --target $Target --ci
-            if ($LASTEXITCODE -ne 0) { throw 'La compilación Android no terminó correctamente.' }
+            if ($ReuseBuiltRust) {
+                $generatedAndroid = Join-Path $project 'src-tauri/gen/android'
+                $rustLibrary = Join-Path $project 'src-tauri/target/aarch64-linux-android/release/libnuviodrive_v1_lib.so'
+                if (-not (Test-Path -LiteralPath $generatedAndroid) -or -not (Test-Path -LiteralPath $rustLibrary)) {
+                    throw 'No existe un proyecto Android generado o una librería Rust ARM64 release reutilizable.'
+                }
+                $rustInputs = @(
+                    Get-ChildItem -LiteralPath (Join-Path $project 'src-tauri/src') -Recurse -File -Filter '*.rs'
+                    Get-Item -LiteralPath (Join-Path $project 'src-tauri/Cargo.toml')
+                    Get-Item -LiteralPath (Join-Path $project 'src-tauri/Cargo.lock')
+                )
+                $latestRustInput = $rustInputs | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+                if ((Get-Item -LiteralPath $rustLibrary).LastWriteTimeUtc -lt $latestRustInput.LastWriteTimeUtc) {
+                    throw "La librería Rust ARM64 está obsoleta respecto a $($latestRustInput.FullName). Recompílala antes de usar -ReuseBuiltRust."
+                }
+                $tauriProperties = Join-Path $generatedAndroid 'app/tauri.properties'
+                if (-not (Test-Path -LiteralPath $tauriProperties) -or (Get-Content -LiteralPath $tauriProperties -Raw) -notmatch "(?m)^tauri\.android\.versionName=$([regex]::Escape($expectedVersion))$") {
+                    throw "El proyecto Android generado no corresponde a la versión $expectedVersion. Regenera Android antes de reutilizar Rust."
+                }
+                $generatedMobile = Join-Path $generatedAndroid 'app/src/main/java/com/nuvio/drive'
+                foreach ($sourceName in @('MainActivity.kt', 'NuvioForegroundService.kt', 'NuvioMobilePlugin.kt', 'NuvioNotificationContent.kt')) {
+                    $sourceFile = Join-Path (Join-Path $project 'android') $sourceName
+                    $generatedFile = Join-Path $generatedMobile $sourceName
+                    if (-not (Test-Path -LiteralPath $sourceFile) -or -not (Test-Path -LiteralPath $generatedFile)) {
+                        throw "Falta la fuente Android persistente o generada: $sourceName"
+                    }
+                    Copy-Item -LiteralPath $sourceFile -Destination $generatedFile -Force
+                }
+                $generatedManifest = Join-Path $generatedAndroid 'app/src/main/AndroidManifest.xml'
+                $generatedManifestText = Get-Content -LiteralPath $generatedManifest -Raw
+                foreach ($permission in @('android.permission.POST_NOTIFICATIONS', 'android.permission.FOREGROUND_SERVICE', 'android.permission.FOREGROUND_SERVICE_DATA_SYNC', 'android.permission.WAKE_LOCK')) {
+                    if ($generatedManifestText -notmatch [regex]::Escape($permission)) {
+                        throw "El proyecto Android generado no declara $permission. Regenera Android antes de empaquetar."
+                    }
+                }
+                if ($generatedManifestText -notmatch 'NuvioForegroundService' -or $generatedManifestText -notmatch 'foregroundServiceType="dataSync"') {
+                    throw 'El proyecto Android generado no declara correctamente el foreground service dataSync de Nuvio.'
+                }
+                $sdkForBuild = if ($env:ANDROID_HOME) {
+                    $env:ANDROID_HOME
+                } elseif ($env:ANDROID_SDK_ROOT) {
+                    $env:ANDROID_SDK_ROOT
+                } elseif ($env:LOCALAPPDATA) {
+                    Join-Path $env:LOCALAPPDATA 'Android/Sdk'
+                } else {
+                    Join-Path $env:USERPROFILE 'AppData/Local/Android/Sdk'
+                }
+                $javaForBuild = Get-ChildItem -LiteralPath (Join-Path $env:USERPROFILE 'Java') -Directory | Where-Object Name -Like 'jdk-17*' | Select-Object -First 1
+                $ndkForBuild = Get-ChildItem -LiteralPath (Join-Path $sdkForBuild 'ndk') -Directory | Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1
+                if (-not $javaForBuild -or -not $ndkForBuild) { throw 'Faltan JDK 17 o Android NDK para empaquetar el APK ARM64.' }
+                $env:ANDROID_HOME = $sdkForBuild
+                $env:ANDROID_SDK_ROOT = $sdkForBuild
+                $env:NDK_HOME = $ndkForBuild.FullName
+                $env:JAVA_HOME = $javaForBuild.FullName
+                Push-Location $generatedAndroid
+                try {
+                    & ./gradlew.bat :app:assembleArm64Release -x :app:rustBuildArm64Release --console=plain
+                    if ($LASTEXITCODE -ne 0) { throw 'No se pudo empaquetar el APK ARM64 reutilizando la librería Rust release.' }
+                } finally { Pop-Location }
+            } else {
+                & node scripts/tauri-android.mjs build --apk --target $Target --ci
+                if ($LASTEXITCODE -ne 0) { throw 'La compilación Android no terminó correctamente.' }
+            }
         } finally { Pop-Location }
     }
     $sdk = if ($env:ANDROID_HOME) {
@@ -119,7 +181,10 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'No se pudo verificar el manifiesto del APK.' }
     $manifest = Get-Content -LiteralPath (Join-Path $project 'qa/android-manifest.log') -Raw
     if ($manifest -match 'application-debuggable') { throw 'El APK de distribución no debe ser depurable.' }
-    if ($manifest -notmatch "uses-permission: name='android.permission.POST_NOTIFICATIONS'") { throw 'El APK no declara POST_NOTIFICATIONS para Android 13+.' }
+    if ($manifest -notmatch "package:.*versionName='$([regex]::Escape($expectedVersion))'") { throw "El APK no corresponde a la versión esperada $expectedVersion." }
+    foreach ($permission in @('android.permission.POST_NOTIFICATIONS', 'android.permission.FOREGROUND_SERVICE', 'android.permission.FOREGROUND_SERVICE_DATA_SYNC', 'android.permission.WAKE_LOCK')) {
+        if ($manifest -notmatch "uses-permission: name='$([regex]::Escape($permission))'") { throw "El APK no declara $permission." }
+    }
     if ($manifest -notmatch "native-code:.*'arm64-v8a'") { throw 'El APK no incluye la arquitectura ARM64 del S24 Ultra.' }
     $output = Join-Path $project 'release/Android'
     New-Item -ItemType Directory -Force -Path $output | Out-Null

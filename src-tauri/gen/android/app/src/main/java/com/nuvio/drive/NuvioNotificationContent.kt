@@ -33,7 +33,7 @@ object NuvioNotificationContent {
             else -> "Subidas completadas"
         }
         return when (data.getStringExtra("phase")) {
-            "analyzing", "copying" -> "Preparando archivos para subir…"
+            "staging", "analyzing", "copying" -> "Preparando archivos para subir…"
             "confirming" -> "Confirmando archivos en Telegram…"
             "retry_wait" -> "Esperando para reintentar la subida…"
             "uploading" -> if (data.hasExtra("percent")) "Subiendo archivos · ${data.getIntExtra("percent", 0)}%" else "Subiendo archivos…"

@@ -11,6 +11,8 @@ mod secrets;
 mod telegram;
 mod transfer;
 mod upload_advisor;
+#[cfg(any(target_os = "android", test))]
+mod upload_notifications;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -37,6 +39,8 @@ struct AppState {
     media_cache_dir: PathBuf,
     cache_usage: Mutex<(std::time::Instant, i64)>,
     preparation_slots: Arc<tokio::sync::Semaphore>,
+    #[cfg(target_os = "android")]
+    upload_preparations: Arc<std::sync::atomic::AtomicUsize>,
     upload_slots: Arc<tokio::sync::Semaphore>,
     download_slots: Arc<tokio::sync::Semaphore>,
     sync_lock: tokio::sync::Mutex<()>,
@@ -73,6 +77,29 @@ fn cleanup_android_staged_source(path: &Path) {
     let _ = fs::remove_file(path);
     if let Some(parent) = path.parent() {
         let _ = fs::remove_dir(parent);
+    }
+}
+
+#[cfg(target_os = "android")]
+struct UploadPreparationGuard {
+    counter: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(target_os = "android")]
+impl Drop for UploadPreparationGuard {
+    fn drop(&mut self) {
+        self.counter
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+#[cfg(target_os = "android")]
+fn begin_upload_preparation(state: &Arc<AppState>) -> UploadPreparationGuard {
+    state
+        .upload_preparations
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    UploadPreparationGuard {
+        counter: state.upload_preparations.clone(),
     }
 }
 
@@ -259,6 +286,9 @@ async fn prepare_zip_uploads(
             return Err("La carpeta está en la papelera".into());
         }
     }
+    let state = state.inner().clone();
+    #[cfg(target_os = "android")]
+    let _upload_preparation = begin_upload_preparation(&state);
     state.telegram.own_chat(&state.repository).await?;
 
     #[cfg(target_os = "android")]
@@ -283,7 +313,6 @@ async fn prepare_zip_uploads(
     #[cfg(not(target_os = "android"))]
     let _ = &mut items;
 
-    let state = state.inner().clone();
     let permit = state
         .preparation_slots
         .clone()
@@ -339,6 +368,8 @@ async fn prepare_upload(
 ) -> Result<PreparedUpload, String> {
     let original_source = path.clone();
     let state = state.inner().clone();
+    #[cfg(target_os = "android")]
+    let _upload_preparation = begin_upload_preparation(&state);
     let delete_source_after_upload = state
         .repository
         .settings()
@@ -1079,21 +1110,6 @@ fn update_setting(
     state.repository.settings().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-async fn update_mobile_sync_notification(data: serde_json::Value) -> Result<(), String> {
-    mobile::update_sync_notification(&data)
-}
-
-#[tauri::command]
-async fn update_mobile_upload_notification(data: serde_json::Value) -> Result<(), String> {
-    mobile::update_upload_notification(&data)
-}
-
-#[tauri::command]
-async fn clear_mobile_notification(id: i32) -> Result<(), String> {
-    mobile::clear_notification(id)
-}
-
 async fn delete_verified_upload_source_inner(
     state: &Arc<AppState>,
     transfer_id: &str,
@@ -1272,6 +1288,55 @@ async fn run_job(state: Arc<AppState>, job: cloud::WorkItem) {
             if let Err(db) = state.repository.mark_retry_or_failed(&job.id, &error) {
                 *state.background_error.lock().expect("background") = Some(db.to_string());
             }
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+async fn upload_notification_worker(state: Arc<AppState>) {
+    let mut tracker = upload_notifications::UploadTracker::default();
+    let mut last_sent: Option<upload_notifications::UploadNotice> = None;
+    let mut last_sent_at = std::time::Instant::now() - Duration::from_secs(10);
+
+    loop {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let Ok(jobs) = state.repository.list_transfers() else {
+            continue;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let preparing = state
+            .upload_preparations
+            .load(std::sync::atomic::Ordering::Acquire);
+        let tracked = tracker.snapshot(&jobs, now);
+        let notice = match tracked {
+            Some(notice) if notice.active || preparing == 0 => notice,
+            _ if preparing > 0 => upload_notifications::UploadNotice::preparing(preparing),
+            Some(notice) => notice,
+            None if last_sent
+                .as_ref()
+                .is_some_and(|notice| notice.active && notice.phase == "staging") =>
+            {
+                upload_notifications::UploadNotice::preparation_finished()
+            }
+            None => continue,
+        };
+
+        // Keep the native foreground service alive independently from WebView timers.
+        // A periodic heartbeat also lets Android recover the service if it was
+        // recreated while the Rust process and transfer engine are still alive.
+        let heartbeat_due = notice.active && last_sent_at.elapsed() >= Duration::from_secs(5);
+        if !heartbeat_due && last_sent.as_ref() == Some(&notice) {
+            continue;
+        }
+        let Ok(payload) = serde_json::to_value(&notice) else {
+            continue;
+        };
+        if mobile::update_upload_notification(&payload).is_ok() {
+            last_sent = Some(notice);
+            last_sent_at = std::time::Instant::now();
         }
     }
 }
@@ -1592,6 +1657,8 @@ pub fn run() {
                 preparation_slots: Arc::new(tokio::sync::Semaphore::new(
                     settings.preparation_concurrency,
                 )),
+                #[cfg(target_os = "android")]
+                upload_preparations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 cache_usage: Mutex::new((std::time::Instant::now() - Duration::from_secs(31), 0)),
                 upload_slots: Arc::new(tokio::sync::Semaphore::new(16)),
                 download_slots: Arc::new(tokio::sync::Semaphore::new(
@@ -1601,6 +1668,8 @@ pub fn run() {
                 background_error: Mutex::new(None),
             });
             app.manage(state.clone());
+            #[cfg(target_os = "android")]
+            tauri::async_runtime::spawn(upload_notification_worker(state.clone()));
             tauri::async_runtime::spawn(worker(state));
             Ok(())
         })
@@ -1667,10 +1736,7 @@ pub fn run() {
             telegram_request_qr,
             telegram_register_user,
             telegram_log_out,
-            telegram_forget_session,
-            update_mobile_sync_notification,
-            update_mobile_upload_notification,
-            clear_mobile_notification
+            telegram_forget_session
         ])
         .run(tauri::generate_context!())
         .expect("error while running Nuvio");

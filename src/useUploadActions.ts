@@ -1,5 +1,6 @@
 import { useState, type Dispatch, type SetStateAction } from "react";
 import { createFolder } from "./bridge/files";
+import { ensureMobileNotificationPermission } from "./bridge/mobile";
 import { readableError } from "./bridge/shared";
 import {
   inspectDroppedPaths,
@@ -154,6 +155,7 @@ export function useUploadActions({
         setNotice("Subida cancelada. No se modificó ningún archivo.");
         return;
       }
+      await ensureMobileNotificationPermission();
 
       const targetFolderId = section === "files" ? currentFolderId : null;
       if (section !== "files") setCurrentFolderId(null);
@@ -334,6 +336,7 @@ export function useUploadActions({
         setNotice("Subida de carpeta cancelada. No se modificó ningún archivo.");
         return;
       }
+      await ensureMobileNotificationPermission();
 
       const targetFolderId = section === "files" ? currentFolderId : null;
       if (section !== "files") setCurrentFolderId(null);
@@ -360,6 +363,7 @@ export function useUploadActions({
       return;
     }
 
+    await ensureMobileNotificationPermission();
     setUploadBusy(true);
     setNotice("Analizando elementos arrastrados…");
     try {

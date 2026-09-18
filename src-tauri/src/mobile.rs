@@ -204,18 +204,8 @@ pub fn update_sync_notification(_data: &serde_json::Value) -> Result<(), String>
     Ok(())
 }
 
-pub fn update_upload_notification(_data: &serde_json::Value) -> Result<(), String> {
-    #[cfg(target_os = "android")]
-    {
-        let _: serde_json::Value = call("updateUploadNotification", _data.clone())?;
-    }
-    Ok(())
-}
-
-pub fn clear_notification(_id: i32) -> Result<(), String> {
-    #[cfg(target_os = "android")]
-    {
-        let _: serde_json::Value = call("clearNotification", serde_json::json!({ "id": _id }))?;
-    }
+#[cfg(target_os = "android")]
+pub fn update_upload_notification(data: &serde_json::Value) -> Result<(), String> {
+    let _: serde_json::Value = call("updateUploadNotification", data.clone())?;
     Ok(())
 }

@@ -1,4 +1,4 @@
-param([ValidateSet('aarch64')][string]$Target = 'aarch64')
+param([ValidateSet('aarch64')][string]$Target = 'aarch64', [switch]$ReuseBuiltRust)
 $ErrorActionPreference = 'Stop'
 $project = Split-Path -Parent $PSScriptRoot
 $signing = Join-Path $project '.release-signing'
@@ -20,8 +20,30 @@ try {
     Remove-Item -LiteralPath $bundleRoot -Recurse -Force -ErrorAction SilentlyContinue
     Push-Location $project
     try {
-        & node scripts/tauri-android.mjs build --aab --apk --target $Target --ci
-        if ($LASTEXITCODE -ne 0) { throw 'No se pudo compilar el AAB.' }
+        if ($ReuseBuiltRust) {
+            & powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-android.ps1 -Target $Target -ReuseBuiltRust
+            if ($LASTEXITCODE -ne 0) { throw 'La validación previa del APK ARM64 reutilizable falló.' }
+            $sdk = if ($env:ANDROID_HOME) {
+                $env:ANDROID_HOME
+            } elseif ($env:ANDROID_SDK_ROOT) {
+                $env:ANDROID_SDK_ROOT
+            } elseif ($env:LOCALAPPDATA) {
+                Join-Path $env:LOCALAPPDATA 'Android/Sdk'
+            } else {
+                Join-Path $env:USERPROFILE 'AppData/Local/Android/Sdk'
+            }
+            $env:ANDROID_HOME = $sdk
+            $env:ANDROID_SDK_ROOT = $sdk
+            $env:JAVA_HOME = $javaDir.FullName
+            Push-Location (Join-Path $project 'src-tauri/gen/android')
+            try {
+                & ./gradlew.bat :app:bundleArm64Release -x :app:rustBuildArm64Release --console=plain
+                if ($LASTEXITCODE -ne 0) { throw 'No se pudo empaquetar el AAB ARM64 reutilizando la librería Rust release.' }
+            } finally { Pop-Location }
+        } else {
+            & node scripts/tauri-android.mjs build --aab --apk --target $Target --ci
+            if ($LASTEXITCODE -ne 0) { throw 'No se pudo compilar el AAB.' }
+        }
     } finally { Pop-Location }
     $bundle = Get-ChildItem -LiteralPath $bundleRoot -Recurse -Filter '*.aab' -File | Sort-Object LastWriteTime -Descending | Select-Object -First 1
     if (-not $bundle) { throw 'No se genero ningun AAB nuevo.' }

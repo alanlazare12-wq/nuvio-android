@@ -1,5 +1,14 @@
 # Historial de Nuvio
 
+## 1.2.5 — 2026-09-18
+
+- Corregido el progreso de subidas en segundo plano: la notificación persistente ya no depende del polling ni de los timers del WebView/React; un worker Rust dedicado observa directamente el estado real de las transferencias y actualiza el foreground service incluso con la app minimizada.
+- El permiso `POST_NOTIFICATIONS` se solicita al iniciar o reanudar una subida en Android 13+, en lugar de esperar al final de la cola; si el usuario lo deniega, la transferencia continúa sin bloquearse.
+- La notificación de subida usa exclusivamente transferencias de tipo `upload`, evitando porcentajes y totales contaminados por descargas u otras operaciones de la cola global.
+- El puente Android de notificaciones usa `applicationContext` y el `main looper`, reduciendo la dependencia de una `Activity`/WebView visible mientras el servicio foreground mantiene el trabajo en segundo plano.
+- Mejorado el seguimiento de fases: preparación indeterminada, prioridad estable de `uploading`/`confirming`/`retry_wait`, ETA y velocidad sólo con datos recientes, y finalización emitida una sola vez.
+- Se mantienen el wake lock, el tipo `dataSync` y el manejo de `Service.onTimeout` requerido por Android 15 para trabajos largos.
+
 ## 1.2.4 — 2026-09-17
 
 - Paridad funcional con la release Windows 1.2.4: archivos individuales de más de 2 GB se convierten en volúmenes ZIP independientes por debajo del límite de Telegram, con nombres descriptivos, manifiesto `NUVIO-SPLIT-MANIFEST.json`, formato `nuvio-split-v1` y SHA-256 por parte y del archivo completo.

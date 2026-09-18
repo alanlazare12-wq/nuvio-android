@@ -78,7 +78,12 @@ class NuvioForegroundService : Service() {
         private fun postCompletion(context: Context, data: Intent) {
             val upload = data.action == ACTION_STOP_UPLOAD
             val manager = context.getSystemService(NotificationManager::class.java)
-            if (data.getStringExtra("phase") == "startup") return
+            val phase = data.getStringExtra("phase")
+            if (phase == "startup") return
+            if (upload && phase == "staging") {
+                manager.cancel(UPLOAD_NOTIFICATION_ID)
+                return
+            }
             if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) return
             channel(context)
             manager.notify(if (upload) UPLOAD_NOTIFICATION_ID else SYNC_NOTIFICATION_ID, builder(context, data, upload, false).build())

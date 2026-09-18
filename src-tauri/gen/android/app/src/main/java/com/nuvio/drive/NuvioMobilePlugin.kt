@@ -3,19 +3,19 @@ package com.nuvio.drive
 import android.app.Activity
 import android.app.NotificationChannel
 import android.app.NotificationManager
-import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.Manifest
 import androidx.activity.result.ActivityResult
-import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import java.util.UUID
@@ -68,15 +68,14 @@ import javax.crypto.spec.GCMParameterSpec
     var speedBps: Long = 0L
     var currentFileName: String? = null
 }
-@InvokeArg class IdArgs {
-    var id: Int = 0
-}
-
 @TauriPlugin
 class NuvioMobilePlugin(private val host: Activity) : Plugin(host) {
     companion object {
         const val MAX_BATCH_UPLOAD_FILES = 250
     }
+    private val appContext: Context = host.applicationContext
+    private val mainHandler = Handler(Looper.getMainLooper())
+
     @Command fun backgroundApp(invoke: Invoke) {
         host.runOnUiThread { host.moveTaskToBack(true); invoke.resolve(JSObject()) }
     }
@@ -176,6 +175,7 @@ class NuvioMobilePlugin(private val host: Activity) : Plugin(host) {
             addCategory(Intent.CATEGORY_OPENABLE)
             type = "*/*"
             putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
         }
         startActivityForResult(invoke, intent, "uploadFilesPicked")
     }
@@ -208,19 +208,20 @@ class NuvioMobilePlugin(private val host: Activity) : Plugin(host) {
                 invoke.resolve(JSObject().apply { put("paths", JSONArray()) })
                 return
             }
-            io.execute {
-                try {
-                    val paths = mutableListOf<String>()
-                    for (uri in uris) {
-                        try {
-                            paths.add(stageContentUriInternal(uri))
-                        } catch (_: Exception) {}
+            val persistFlags = data.flags and Intent.FLAG_GRANT_READ_URI_PERMISSION
+            for (uri in uris) {
+                if (persistFlags != 0) {
+                    try {
+                        host.contentResolver.takePersistableUriPermission(uri, persistFlags)
+                    } catch (_: Exception) {
+                        // Some document providers do not support persistable grants.
+                        // Preparation starts immediately, so the temporary read grant is still usable.
                     }
-                    invoke.resolve(JSObject().apply { put("paths", JSONArray(paths)) })
-                } catch (e: Exception) {
-                    invoke.reject(e.message ?: "Error al procesar archivos seleccionados")
                 }
             }
+            invoke.resolve(JSObject().apply {
+                put("paths", JSONArray(uris.map { it.toString() }))
+            })
         } catch (error: Exception) {
             invoke.reject(error.message ?: "No se pudieron seleccionar los archivos")
         }
@@ -291,10 +292,9 @@ class NuvioMobilePlugin(private val host: Activity) : Plugin(host) {
                                         error("La carpeta contiene más de $MAX_BATCH_UPLOAD_FILES archivos. Para proteger la estabilidad del dispositivo móvil, el límite máximo es de $MAX_BATCH_UPLOAD_FILES archivos. Sube carpetas más pequeñas o comprímela en un archivo ZIP.")
                                     }
                                     val fileDocUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, childId)
-                                    val staged = stageContentUriInternal(fileDocUri)
                                     val item = JSObject().apply {
                                         put("relativePath", relPath)
-                                        put("absolutePath", staged)
+                                        put("absolutePath", fileDocUri.toString())
                                         put("size", size)
                                     }
                                     files.add(item)
@@ -408,8 +408,6 @@ class NuvioMobilePlugin(private val host: Activity) : Plugin(host) {
     }
 
     private val CHANNEL_ID = "nuvio_status_channel"
-    private val SYNC_NOTIFICATION_ID = 1001
-    private val UPLOAD_NOTIFICATION_ID = 1002
 
     init {
         createNotificationChannel()
@@ -424,42 +422,26 @@ class NuvioMobilePlugin(private val host: Activity) : Plugin(host) {
                 description = descriptionText
                 setShowBadge(false)
             }
-            val notificationManager = host.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+            val notificationManager = appContext.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
             notificationManager?.createNotificationChannel(channel)
         }
     }
 
     private fun canPostNotifications(): Boolean {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            ContextCompat.checkSelfPermission(host, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+            ContextCompat.checkSelfPermission(appContext, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
         } else {
-            NotificationManagerCompat.from(host).areNotificationsEnabled()
+            NotificationManagerCompat.from(appContext).areNotificationsEnabled()
         }
     }
 
-    private fun getLaunchPendingIntent(): PendingIntent? {
-        val launchIntent = host.packageManager.getLaunchIntentForPackage(host.packageName)?.apply {
-            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
-        } ?: return null
-        return PendingIntent.getActivity(
-            host,
-            0,
-            launchIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-    }
-
-    private fun formatSize(bytes: Long): String {
-        if (bytes <= 0) return "0 B"
-        val units = arrayOf("B", "KB", "MB", "GB", "TB")
-        val digitGroups = (Math.log10(bytes.toDouble()) / Math.log10(1024.0)).toInt().coerceIn(0, units.size - 1)
-        return "%.1f %s".format(bytes / Math.pow(1024.0, digitGroups.toDouble()), units[digitGroups])
-    }
-
     private fun deliverNotification(invoke: Invoke, intent: Intent) {
-        host.runOnUiThread {
+        // Notification delivery must not depend on a visible Activity/WebView.
+        // The process main looper remains available while the foreground service
+        // keeps uploads alive in the background.
+        mainHandler.post {
             try {
-                NuvioForegroundService.dispatch(host, intent)
+                NuvioForegroundService.dispatch(appContext, intent)
                 invoke.resolve(JSObject().apply { put("posted", canPostNotifications()) })
             } catch (error: Exception) {
                 invoke.reject(error.message ?: "Android no pudo mostrar el progreso")
@@ -487,16 +469,5 @@ class NuvioMobilePlugin(private val host: Activity) : Plugin(host) {
         args.percent?.let { intent.putExtra("percent", it) }
         args.etaSeconds?.let { intent.putExtra("etaSeconds", it) }
         deliverNotification(invoke, intent)
-    }
-
-    @Command fun clearNotification(invoke: Invoke) {
-        try {
-            val args = invoke.parseArgs(IdArgs::class.java)
-            val notificationManager = NotificationManagerCompat.from(host)
-            notificationManager.cancel(args.id)
-            invoke.resolve(JSObject())
-        } catch (e: Exception) {
-            invoke.reject(e.message ?: "Error al limpiar notificación")
-        }
     }
 }

@@ -14,6 +14,7 @@ import {
   resumeTransfer,
   retryTransfer,
 } from "../bridge/transfers";
+import { ensureMobileNotificationPermission } from "../bridge/mobile";
 import { formatBytes, formatEta, formatSpeed } from "../format";
 import type { TransferJob } from "../types";
 
@@ -109,7 +110,10 @@ export function TransferRow({ job, connected, onAction }: TransferRowProps) {
           <button
             className="ghost-icon"
             disabled={!connected && job.direction === "upload"}
-            onClick={() => onAction(() => resumeTransfer(job.id))}
+            onClick={() => onAction(async () => {
+              if (job.direction === "upload") await ensureMobileNotificationPermission();
+              return resumeTransfer(job.id);
+            })}
             title="Continuar"
           >
             <Play size={15} />
@@ -119,7 +123,10 @@ export function TransferRow({ job, connected, onAction }: TransferRowProps) {
           <button
             className="ghost-icon"
             disabled={!connected}
-            onClick={() => onAction(() => retryTransfer(job.id))}
+            onClick={() => onAction(async () => {
+              if (job.direction === "upload") await ensureMobileNotificationPermission();
+              return retryTransfer(job.id);
+            })}
             title="Reintentar"
           >
             <RotateCcw size={15} />

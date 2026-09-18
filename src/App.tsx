@@ -48,6 +48,7 @@ import {
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import {
   backgroundApp,
+  ensureMobileNotificationPermission,
   listenMobileBack,
   loadDashboard,
   pauseQueue,
@@ -592,6 +593,9 @@ function App() {
   const queueProgress = queue.totalBytes > 0 ? Math.round((queue.processedBytes / queue.totalBytes) * 100) : 0;
   const queueHasActive = queue.active > 0;
   const queueHasPaused = dashboard.transfers.some((job) => job.status === "paused");
+  const queueHasPausedUpload = dashboard.transfers.some(
+    (job) => job.direction === "upload" && job.status === "paused",
+  );
 
   return (
     <div
@@ -789,7 +793,10 @@ function App() {
                 <button className="secondary-button" onClick={() => setSection("history")}><Clock3 size={15} /> Historial</button>
                 <button className="secondary-button" onClick={() => void handleExportDiagnostics()}><FileText size={15} /> Diagnóstico</button>
                 {queueHasActive && <button className="secondary-button" onClick={() => void action(pauseQueue)}><Pause size={15} /> Pausar cola</button>}
-                {queueHasPaused && <button className="secondary-button" onClick={() => void action(resumeQueue)}><Play size={15} /> Continuar</button>}
+                {queueHasPaused && <button className="secondary-button" onClick={() => void action(async () => {
+                  if (queueHasPausedUpload) await ensureMobileNotificationPermission();
+                  return resumeQueue();
+                })}><Play size={15} /> Continuar</button>}
               </div>
             </div>
             <div className="queue-overview">

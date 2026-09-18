@@ -4,8 +4,6 @@ import {
   requestPermission,
   sendNotification,
 } from "@tauri-apps/plugin-notification";
-import { updateUploadNotification } from "./bridge/mobile";
-import { isTransferPending } from "./components/TransferRows";
 import type { DashboardData } from "./types";
 
 type UseDashboardLifecycleOptions = {
@@ -25,8 +23,6 @@ export function useDashboardLifecycle({
   invalidateDashboardRequests,
   setNotice,
 }: UseDashboardLifecycleOptions) {
-  const previousUploadActiveRef = useRef(false);
-  const previousUploadKeyRef = useRef("");
   const previousPendingRef = useRef<number | null>(null);
 
   useEffect(() => {
@@ -61,68 +57,6 @@ export function useDashboardLifecycle({
       window.clearTimeout(timer);
     };
   }, []);
-
-  useEffect(() => {
-    if (!dashboard) return;
-
-    const q = dashboard.queueSummary;
-    const activeUploads = dashboard.transfers.filter(
-      (transfer) => transfer.direction === "upload" && isTransferPending(transfer),
-    );
-    const hasActive = activeUploads.length > 0 || (q.pending > 0 && q.active > 0);
-    const wasActive = previousUploadActiveRef.current;
-
-    if (hasActive) {
-      previousUploadActiveRef.current = true;
-      const currentFileName = activeUploads[0]?.fileName ?? null;
-      const pct = q.totalBytes > 0
-        ? Math.round((q.processedBytes / q.totalBytes) * 100)
-        : null;
-      const key = [
-        pct,
-        q.completed,
-        q.pending,
-        currentFileName,
-        Math.round(q.speedBps / 50000),
-      ].join(":");
-
-      if (key !== previousUploadKeyRef.current) {
-        previousUploadKeyRef.current = key;
-        void updateUploadNotification({
-          active: true,
-          total: q.total,
-          completed: q.completed,
-          pending: q.pending,
-          failed: q.failed,
-          percent: pct,
-          processedBytes: q.processedBytes,
-          totalBytes: q.totalBytes,
-          speedBps: q.speedBps,
-          currentFileName,
-        });
-      }
-    } else if (wasActive) {
-      previousUploadActiveRef.current = false;
-      previousUploadKeyRef.current = "";
-      void updateUploadNotification({
-        active: false,
-        total: q.total,
-        completed: q.completed,
-        pending: 0,
-        failed: q.failed,
-        percent: 100,
-        processedBytes: q.totalBytes,
-        totalBytes: q.totalBytes,
-        speedBps: 0,
-      });
-    }
-  }, [
-    dashboard?.queueSummary?.pending,
-    dashboard?.queueSummary?.completed,
-    dashboard?.queueSummary?.processedBytes,
-    dashboard?.queueSummary?.speedBps,
-    dashboard?.transfers,
-  ]);
 
   useEffect(() => {
     if (!dashboard) return;

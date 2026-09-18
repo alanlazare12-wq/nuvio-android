@@ -3,7 +3,33 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 
 fn active(job: &TransferJob) -> bool {
-    matches!(job.status.as_str(), "waiting" | "analyzing" | "copying" | "ready" | "queued" | "uploading" | "confirming" | "retry_wait" | "running")
+    matches!(
+        job.status.as_str(),
+        "waiting"
+            | "analyzing"
+            | "copying"
+            | "ready"
+            | "queued"
+            | "uploading"
+            | "confirming"
+            | "retry_wait"
+            | "running"
+    )
+}
+
+fn phase_rank(status: &str) -> u8 {
+    match status {
+        "uploading" => 9,
+        "confirming" => 8,
+        "retry_wait" => 7,
+        "copying" => 6,
+        "analyzing" => 5,
+        "running" => 4,
+        "queued" => 3,
+        "ready" => 2,
+        "waiting" => 1,
+        _ => 0,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -25,6 +51,46 @@ pub(crate) struct UploadNotice {
     pub phase: String,
 }
 
+impl UploadNotice {
+    pub(crate) fn preparing(count: usize) -> Self {
+        Self {
+            active: true,
+            total: count,
+            completed: 0,
+            pending: count,
+            failed: 0,
+            paused: 0,
+            cancelled: 0,
+            percent: None,
+            processed_bytes: 0,
+            total_bytes: 0,
+            speed_bps: 0,
+            eta_seconds: None,
+            current_file_name: None,
+            phase: "staging".into(),
+        }
+    }
+
+    pub(crate) fn preparation_finished() -> Self {
+        Self {
+            active: false,
+            total: 0,
+            completed: 0,
+            pending: 0,
+            failed: 0,
+            paused: 0,
+            cancelled: 0,
+            percent: None,
+            processed_bytes: 0,
+            total_bytes: 0,
+            speed_bps: 0,
+            eta_seconds: None,
+            current_file_name: None,
+            phase: "staging".into(),
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct UploadTracker {
     jobs: BTreeMap<String, TransferJob>,
@@ -33,13 +99,24 @@ pub(crate) struct UploadTracker {
 
 impl UploadTracker {
     pub fn snapshot(&mut self, all: &[TransferJob], now: i64) -> Option<UploadNotice> {
-        let running: Vec<_> = all.iter().filter(|j| j.direction == "upload" && active(j)).collect();
-        if running.is_empty() && !self.was_active { return None; }
+        let running: Vec<_> = all
+            .iter()
+            .filter(|j| j.direction == "upload" && active(j))
+            .collect();
+        if running.is_empty() && !self.was_active {
+            return None;
+        }
         if !self.was_active && running.iter().all(|j| !self.jobs.contains_key(&j.id)) {
             self.jobs.clear();
         }
-        let latest_jobs: BTreeMap<_, _> = all.iter().filter(|j| j.direction == "upload").map(|j| (j.id.as_str(), j)).collect();
-        for job in &running { self.jobs.insert(job.id.clone(), (*job).clone()); }
+        let latest_jobs: BTreeMap<_, _> = all
+            .iter()
+            .filter(|j| j.direction == "upload")
+            .map(|j| (j.id.as_str(), j))
+            .collect();
+        for job in &running {
+            self.jobs.insert(job.id.clone(), (*job).clone());
+        }
         for job in self.jobs.values_mut() {
             if let Some(latest) = latest_jobs.get(job.id.as_str()) {
                 *job = (*latest).clone();
@@ -48,18 +125,33 @@ impl UploadTracker {
             }
         }
         let mut notice = UploadNotice {
-            active: !running.is_empty(), total: self.jobs.len(), completed: 0, pending: 0,
-            failed: 0, paused: 0, cancelled: 0, percent: None, processed_bytes: 0,
-            total_bytes: 0, speed_bps: 0, eta_seconds: None, current_file_name: None,
+            active: !running.is_empty(),
+            total: self.jobs.len(),
+            completed: 0,
+            pending: 0,
+            failed: 0,
+            paused: 0,
+            cancelled: 0,
+            percent: None,
+            processed_bytes: 0,
+            total_bytes: 0,
+            speed_bps: 0,
+            eta_seconds: None,
+            current_file_name: None,
             phase: "waiting".into(),
         };
         let mut known_sizes = true;
+        let mut selected_phase_rank = 0_u8;
+        let mut has_network_progress = false;
         for job in self.jobs.values() {
             match job.status.as_str() {
                 "completed" | "duplicate" => notice.completed += 1,
                 "failed" => notice.failed += 1,
                 "paused" => notice.paused += 1,
-                "cancelled" => { notice.cancelled += 1; continue; }
+                "cancelled" => {
+                    notice.cancelled += 1;
+                    continue;
+                }
                 _ => notice.pending += 1,
             }
             let size = job.total_bytes.max(0);
@@ -72,24 +164,40 @@ impl UploadTracker {
                 _ => job.processed_bytes.clamp(0, size),
             };
             notice.processed_bytes = notice.processed_bytes.saturating_add(bytes);
-            if job.status == "uploading" {
-                notice.current_file_name.get_or_insert_with(|| job.file_name.clone());
-                notice.phase = "uploading".into();
-                if now.saturating_sub(job.updated_at) <= 5 {
-                    notice.speed_bps = notice.speed_bps.saturating_add(job.speed_bps.max(0));
+            has_network_progress |= matches!(
+                job.status.as_str(),
+                "uploading" | "confirming" | "completed" | "duplicate"
+            );
+
+            if active(job) {
+                let rank = phase_rank(&job.status);
+                if rank > selected_phase_rank {
+                    selected_phase_rank = rank;
+                    notice.phase = job.status.clone();
+                    notice.current_file_name = Some(job.file_name.clone());
                 }
-            } else if notice.phase != "uploading" && active(job) {
-                notice.phase = job.status.clone();
+            }
+            if job.status == "uploading" && now.saturating_sub(job.updated_at) <= 5 {
+                notice.speed_bps = notice.speed_bps.saturating_add(job.speed_bps.max(0));
             }
         }
         let finished = notice.completed == notice.total && notice.total > 0;
-        if finished { notice.percent = Some(100); }
-        else if known_sizes && notice.total_bytes > 0 {
-            notice.percent = Some(((notice.processed_bytes as f64 / notice.total_bytes as f64 * 100.0) as u8).min(99));
+        if finished {
+            notice.percent = Some(100);
+        } else if has_network_progress && known_sizes && notice.total_bytes > 0 {
+            notice.percent = Some(
+                ((notice.processed_bytes as f64 / notice.total_bytes as f64 * 100.0) as u8).min(99),
+            );
         }
         let remaining = notice.total_bytes.saturating_sub(notice.processed_bytes);
-        if known_sizes && notice.speed_bps > 0 && remaining > 0 && notice.paused == 0 && notice.failed == 0 {
-            notice.eta_seconds = Some(remaining / notice.speed_bps + i64::from(remaining % notice.speed_bps != 0));
+        if known_sizes
+            && notice.speed_bps > 0
+            && remaining > 0
+            && notice.paused == 0
+            && notice.failed == 0
+        {
+            notice.eta_seconds =
+                Some(remaining / notice.speed_bps + i64::from(remaining % notice.speed_bps != 0));
         }
         self.was_active = notice.active;
         Some(notice)
@@ -100,29 +208,72 @@ impl UploadTracker {
 mod tests {
     use super::*;
     fn job(id: &str, status: &str, bytes: i64) -> TransferJob {
-        TransferJob { id: id.into(), file_name: format!("{id}.mp4"), direction: "upload".into(), progress: 0,
-            status: status.into(), phase: status.into(), speed_label: String::new(), processed_bytes: bytes,
-            total_bytes: 100, speed_bps: 10, eta_seconds: None, attempts: 0, max_attempts: 5,
-            error: None, can_pause: true, can_retry: false, can_cancel: true, started_at: Some(100), updated_at: 100 }
+        TransferJob {
+            id: id.into(),
+            file_name: format!("{id}.mp4"),
+            direction: "upload".into(),
+            progress: 0,
+            status: status.into(),
+            phase: status.into(),
+            speed_label: String::new(),
+            processed_bytes: bytes,
+            total_bytes: 100,
+            speed_bps: 10,
+            eta_seconds: None,
+            attempts: 0,
+            max_attempts: 5,
+            error: None,
+            can_pause: true,
+            can_retry: false,
+            can_cancel: true,
+            source_delete_available: false,
+            source_deleted: false,
+            source_delete_error: None,
+            started_at: Some(100),
+            updated_at: 100,
+        }
     }
     #[test]
     fn excludes_downloads_history_and_counts_current_batch() {
         let mut tracker = UploadTracker::default();
-        let mut download = job("download", "downloading", 80); download.direction = "download".into();
-        let notice = tracker.snapshot(&[job("old", "completed", 100), download, job("a", "uploading", 50), job("b", "queued", 100)], 100).unwrap();
+        let mut download = job("download", "downloading", 80);
+        download.direction = "download".into();
+        let notice = tracker
+            .snapshot(
+                &[
+                    job("old", "completed", 100),
+                    download,
+                    job("a", "uploading", 50),
+                    job("b", "queued", 100),
+                ],
+                100,
+            )
+            .unwrap();
         assert_eq!((notice.total, notice.completed, notice.pending), (2, 0, 2));
-        assert_eq!((notice.total_bytes, notice.processed_bytes, notice.percent), (200, 50, Some(25)));
+        assert_eq!(
+            (notice.total_bytes, notice.processed_bytes, notice.percent),
+            (200, 50, Some(25))
+        );
         assert_eq!(notice.eta_seconds, Some(15));
     }
     #[test]
     fn completion_keeps_batch_denominator_and_is_emitted_once() {
         let mut tracker = UploadTracker::default();
         tracker.snapshot(&[job("a", "uploading", 50), job("b", "queued", 0)], 100);
-        let halfway = tracker.snapshot(&[job("a", "completed", 100), job("b", "uploading", 50)], 100).unwrap();
+        let halfway = tracker
+            .snapshot(
+                &[job("a", "completed", 100), job("b", "uploading", 50)],
+                100,
+            )
+            .unwrap();
         assert_eq!((halfway.completed, halfway.percent), (1, Some(75)));
         let jobs = [job("a", "completed", 100), job("b", "completed", 100)];
         let done = tracker.snapshot(&jobs, 100).unwrap();
-        assert!(!done.active); assert_eq!((done.total, done.completed, done.percent), (2, 2, Some(100)));
+        assert!(!done.active);
+        assert_eq!(
+            (done.total, done.completed, done.percent),
+            (2, 2, Some(100))
+        );
         assert!(tracker.snapshot(&jobs, 100).is_none());
     }
     #[test]
@@ -131,8 +282,15 @@ mod tests {
             let mut tracker = UploadTracker::default();
             tracker.snapshot(&[job("a", "uploading", 50)], 100);
             let stopped = tracker.snapshot(&[job("a", status, 50)], 100).unwrap();
-            assert!(!stopped.active); assert_eq!(stopped.completed, 0); assert_ne!(stopped.percent, Some(100));
-            assert!(tracker.snapshot(&[job("a", "uploading", 60)], 100).unwrap().active);
+            assert!(!stopped.active);
+            assert_eq!(stopped.completed, 0);
+            assert_ne!(stopped.percent, Some(100));
+            assert!(
+                tracker
+                    .snapshot(&[job("a", "uploading", 60)], 100)
+                    .unwrap()
+                    .active
+            );
         }
     }
     #[test]
@@ -140,9 +298,13 @@ mod tests {
         let mut tracker = UploadTracker::default();
         let stale = tracker.snapshot(&[job("a", "uploading", 50)], 106).unwrap();
         assert_eq!((stale.speed_bps, stale.eta_seconds), (0, None));
-        let confirming = tracker.snapshot(&[job("a", "confirming", 100)], 106).unwrap();
-        assert_eq!(confirming.percent, Some(99)); assert_eq!(confirming.eta_seconds, None);
-        let mut unknown = job("b", "analyzing", 0); unknown.total_bytes = 0;
+        let confirming = tracker
+            .snapshot(&[job("a", "confirming", 100)], 106)
+            .unwrap();
+        assert_eq!(confirming.percent, Some(99));
+        assert_eq!(confirming.eta_seconds, None);
+        let mut unknown = job("b", "analyzing", 0);
+        unknown.total_bytes = 0;
         let notice = tracker.snapshot(&[unknown], 106).unwrap();
         assert_eq!((notice.percent, notice.eta_seconds), (None, None));
     }
@@ -151,7 +313,44 @@ mod tests {
         let mut tracker = UploadTracker::default();
         tracker.snapshot(&[job("a", "uploading", 50)], 100);
         tracker.snapshot(&[job("a", "failed", 50)], 100);
-        let notice = tracker.snapshot(&[job("a", "failed", 50), job("b", "uploading", 20)], 100).unwrap();
-        assert_eq!((notice.total, notice.failed, notice.percent), (1, 0, Some(20)));
+        let notice = tracker
+            .snapshot(&[job("a", "failed", 50), job("b", "uploading", 20)], 100)
+            .unwrap();
+        assert_eq!(
+            (notice.total, notice.failed, notice.percent),
+            (1, 0, Some(20))
+        );
+    }
+
+    #[test]
+    fn synthetic_staging_notice_is_indeterminate_and_has_silent_stop_marker() {
+        let active = UploadNotice::preparing(3);
+        assert!(active.active);
+        assert_eq!((active.total, active.pending), (3, 3));
+        assert_eq!(active.percent, None);
+        assert_eq!(active.phase, "staging");
+
+        let stopped = UploadNotice::preparation_finished();
+        assert!(!stopped.active);
+        assert_eq!(stopped.total, 0);
+        assert_eq!(stopped.phase, "staging");
+    }
+
+    #[test]
+    fn preparation_is_indeterminate_and_phase_priority_is_stable() {
+        let mut tracker = UploadTracker::default();
+        let preparing = tracker
+            .snapshot(&[job("z", "queued", 0), job("a", "copying", 50)], 100)
+            .unwrap();
+        assert_eq!(preparing.phase, "copying");
+        assert_eq!(preparing.current_file_name.as_deref(), Some("a.mp4"));
+        assert_eq!(preparing.percent, None);
+
+        let uploading = tracker
+            .snapshot(&[job("z", "uploading", 10), job("a", "copying", 50)], 100)
+            .unwrap();
+        assert_eq!(uploading.phase, "uploading");
+        assert_eq!(uploading.current_file_name.as_deref(), Some("z.mp4"));
+        assert_eq!(uploading.percent, Some(5));
     }
 }
