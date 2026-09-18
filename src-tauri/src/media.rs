@@ -25,6 +25,7 @@ pub struct ThumbnailSource {
     pub kind: String,
     pub path: Option<String>,
     pub data_url: Option<String>,
+    pub blurred: bool,
 }
 
 impl TelegramService {
@@ -36,6 +37,18 @@ impl TelegramService {
         cache_limit: i64,
     ) -> Result<Option<ThumbnailSource>, String> {
         let doc = repo.remote(file_id)?;
+        if let Some(mini) = doc
+            .minithumbnail
+            .as_ref()
+            .filter(|data| !data.is_empty() && data.len() <= 64 * 1024)
+        {
+            return Ok(Some(ThumbnailSource {
+                kind: "image".into(),
+                path: None,
+                data_url: Some(format!("data:image/jpeg;base64,{mini}")),
+                blurred: true,
+            }));
+        }
         let chat = self.own_chat(repo).await?;
         let e::Message::Message(message) =
             call(f::get_message(chat, doc.message_id, self.client_id())).await?;
@@ -48,10 +61,12 @@ impl TelegramService {
             .minithumbnail
             .filter(|mini| mini.data.len() <= 64 * 1024)
         {
+            repo.cache_minithumbnail(file_id, &mini.data)?;
             return Ok(Some(ThumbnailSource {
                 kind: "image".into(),
                 path: None,
                 data_url: Some(format!("data:image/jpeg;base64,{}", mini.data)),
+                blurred: true,
             }));
         }
         if let Some(thumb) = content
@@ -81,6 +96,7 @@ impl TelegramService {
                         kind: "image".into(),
                         path: Some(target.to_string_lossy().into_owned()),
                         data_url: None,
+                        blurred: false,
                     }));
                 }
             }
@@ -100,6 +116,7 @@ impl TelegramService {
             kind: kind.into(),
             path: Some(ready.path),
             data_url: None,
+            blurred: false,
         }))
     }
 

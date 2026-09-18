@@ -8,11 +8,9 @@ mod progress;
 mod provider;
 mod repository;
 mod secrets;
-mod startup;
 mod telegram;
 mod transfer;
-#[cfg(any(target_os = "android", test))]
-mod upload_notifications;
+mod upload_advisor;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -22,7 +20,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use cloud::BatchDownloadItem;
-use crypto::decrypt_file;
+use crypto::{decrypt_file, sha256_file};
 use domain::{AppSettings, DashboardData};
 use media::{clear_media_cache, remove_media_cache_entries, MediaReady};
 use provider::StorageProvider;
@@ -45,20 +43,88 @@ struct AppState {
     background_error: Mutex<Option<String>>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncDelta {
+    cursor: i64,
+    sync_progress: progress::SyncProgress,
+    files: Vec<domain::CloudFile>,
+    folders: Option<Vec<domain::CloudFolder>>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UploadedImageCleanupSummary {
+    count: usize,
+    bytes: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UploadedImageCleanupResult {
+    deleted: usize,
+    released_bytes: i64,
+    skipped: usize,
+    failed: usize,
+}
+
+#[cfg(target_os = "android")]
+fn cleanup_android_staged_source(path: &Path) {
+    let _ = fs::remove_file(path);
+    if let Some(parent) = path.parent() {
+        let _ = fs::remove_dir(parent);
+    }
+}
+
 #[tauri::command]
-async fn get_dashboard(
-    app: tauri::AppHandle,
-    startup: State<'_, startup::Startup>,
-) -> Result<DashboardData, String> {
-    startup.wait(Duration::from_secs(30)).await?;
-    let state = app
-        .try_state::<Arc<AppState>>()
-        .ok_or("No se pudo cargar el estado de Nuvio. Cierra y vuelve a abrir la aplicación.")?
-        .inner()
-        .clone();
+async fn get_dashboard(state: State<'_, Arc<AppState>>) -> Result<DashboardData, String> {
+    let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || dashboard_snapshot(&state))
         .await
         .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn get_sync_delta(
+    state: State<'_, Arc<AppState>>,
+    after_rowid: Option<i64>,
+) -> Result<SyncDelta, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let progress = state
+            .telegram
+            .sync_progress
+            .lock()
+            .map_err(|e| e.to_string())?
+            .clone();
+        let (cursor, files) = match after_rowid {
+            Some(after) => state
+                .repository
+                .sync_file_delta(after)
+                .map_err(|e| e.to_string())?,
+            None => (
+                state
+                    .repository
+                    .catalog_rowid_cursor()
+                    .map_err(|e| e.to_string())?,
+                Vec::new(),
+            ),
+        };
+        let folders =
+            if after_rowid.is_none() || progress.phase == crate::progress::SyncPhase::Folders {
+                Some(state.repository.list_folders().map_err(|e| e.to_string())?)
+            } else {
+                None
+            };
+        Ok(SyncDelta {
+            cursor,
+            sync_progress: progress,
+            files,
+            folders,
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 fn dashboard_snapshot(state: &AppState) -> Result<DashboardData, String> {
@@ -80,9 +146,10 @@ fn dashboard_snapshot(state: &AppState) -> Result<DashboardData, String> {
         .cloned()
         .collect();
     let transfer_history = all_transfers
-        .into_iter()
+        .iter()
         .filter(|job| matches!(job.status.as_str(), "completed" | "duplicate" | "cancelled"))
         .take(1000)
+        .cloned()
         .collect();
     let telegram_status = state.telegram.status();
     let settings = state.repository.settings().map_err(|e| e.to_string())?;
@@ -98,7 +165,7 @@ fn dashboard_snapshot(state: &AppState) -> Result<DashboardData, String> {
     };
     let queue_summary = state
         .repository
-        .queue_summary(cache_bytes)
+        .queue_summary_from_jobs(&all_transfers, cache_bytes)
         .map_err(|e| e.to_string())?;
 
     let total_bytes = files
@@ -161,6 +228,19 @@ fn set_favorite(
 }
 
 #[tauri::command]
+async fn analyze_upload_selection(
+    state: State<'_, Arc<AppState>>,
+    items: Vec<upload_advisor::UploadAdvisoryItem>,
+) -> Result<upload_advisor::UploadAdvisory, String> {
+    let provider_limit_bytes = state.telegram.max_upload_bytes();
+    tauri::async_runtime::spawn_blocking(move || {
+        upload_advisor::analyze_upload_selection(&items, provider_limit_bytes)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
 async fn prepare_zip_uploads(
     app: tauri::AppHandle,
     state: State<'_, Arc<AppState>>,
@@ -179,15 +259,30 @@ async fn prepare_zip_uploads(
             return Err("La carpeta está en la papelera".into());
         }
     }
+    state.telegram.own_chat(&state.repository).await?;
+
+    #[cfg(target_os = "android")]
+    let mut staged_android_sources = Vec::new();
     #[cfg(target_os = "android")]
     for item in &mut items {
         if item.path.starts_with("content://") {
-            item.path = mobile::stage_content_uri(&item.path).await?;
+            match mobile::stage_content_uri(&item.path).await {
+                Ok(staged) => {
+                    staged_android_sources.push(PathBuf::from(&staged));
+                    item.path = staged;
+                }
+                Err(error) => {
+                    for staged in &staged_android_sources {
+                        cleanup_android_staged_source(staged);
+                    }
+                    return Err(error);
+                }
+            }
         }
     }
     #[cfg(not(target_os = "android"))]
     let _ = &mut items;
-    state.telegram.own_chat(&state.repository).await?;
+
     let state = state.inner().clone();
     let permit = state
         .preparation_slots
@@ -195,7 +290,7 @@ async fn prepare_zip_uploads(
         .acquire_owned()
         .await
         .map_err(|e| e.to_string())?;
-    tauri::async_runtime::spawn_blocking(move || {
+    let result = tauri::async_runtime::spawn_blocking(move || {
         let _permit = permit;
         let temp = tempfile::Builder::new()
             .prefix("zip-")
@@ -208,24 +303,30 @@ async fn prepare_zip_uploads(
         let results: Vec<_> = paths
             .iter()
             .map(|path| {
-                TransferService::prepare_upload_in_folder(
+                TransferService::adopt_generated_upload_in_folder(
                     &state.repository,
                     &path.to_string_lossy(),
-                    false,
-                    None,
                     &state.staging_dir,
                     folder_id.as_deref(),
                 )
             })
             .collect();
-        // A paused preparation still needs its source to resume after this command returns.
+        // If one generated archive could not be adopted, preserve the temporary
+        // source so it is not silently discarded while reporting the failure.
         if results.iter().any(Result::is_err) {
             let _ = temp.keep();
         }
         Ok(results)
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+
+    #[cfg(target_os = "android")]
+    for staged in &staged_android_sources {
+        cleanup_android_staged_source(staged);
+    }
+
+    result
 }
 
 #[tauri::command]
@@ -236,11 +337,13 @@ async fn prepare_upload(
     passphrase: Option<String>,
     folder_id: Option<String>,
 ) -> Result<PreparedUpload, String> {
-    #[cfg(target_os = "android")]
-    if path.starts_with("content://") {
-        path = mobile::stage_content_uri(&path).await?;
-    }
+    let original_source = path.clone();
     let state = state.inner().clone();
+    let delete_source_after_upload = state
+        .repository
+        .settings()
+        .map_err(|e| e.to_string())?
+        .delete_original_after_upload;
     if let Some(folder) = folder_id.as_deref() {
         let target = state
             .repository
@@ -260,68 +363,75 @@ async fn prepare_upload(
     if encrypt {
         return Err("El cifrado adicional de archivos todavía no está habilitado para transferencias Telegram".into());
     }
-    let limit = if state.telegram.cached_snapshot().is_premium {
-        4_000_000_000u64
+
+    #[cfg(target_os = "android")]
+    let staged_android_source = if path.starts_with("content://") {
+        path = mobile::stage_content_uri(&path).await?;
+        Some(PathBuf::from(&path))
     } else {
-        2_000_000_000u64
+        None
     };
-    let source = transfer::normalize_path(&path)?;
-    let metadata = fs::metadata(&source).map_err(|e| e.to_string())?;
-    if !metadata.is_file() {
-        return Err("La selección no es un archivo".into());
-    }
-    let size = metadata.len();
-    if size == 0 {
-        #[cfg(target_os = "android")]
-        if source.to_string_lossy().contains("upload_staging") {
-            let _ = fs::remove_file(&source);
+
+    let result: Result<PreparedUpload, String> = async {
+        let limit = state.telegram.max_upload_bytes();
+        let source = transfer::normalize_path(&path)?;
+        let metadata = fs::metadata(&source).map_err(|e| e.to_string())?;
+        if !metadata.is_file() {
+            return Err("La selección no es un archivo".into());
         }
-        return Err("Telegram no permite subir archivos vacíos (0 B)".into());
-    }
-    if size > limit {
-        #[cfg(target_os = "android")]
-        if source.to_string_lossy().contains("upload_staging") {
-            let _ = fs::remove_file(&source);
+        let size = metadata.len();
+        if size == 0 {
+            return Err("Telegram no permite subir archivos vacíos (0 B)".into());
         }
-        let size_gb = size as f64 / 1_000_000_000.0;
-        return Err(format!(
-            "Pesa {:.2} GB. Supera el límite de {} GB por archivo de Telegram ({})",
-            size_gb,
-            limit / 1_000_000_000,
-            if state.telegram.cached_snapshot().is_premium {
-                "límite Telegram Premium"
-            } else {
-                "cuenta estándar"
-            }
-        ));
+        if size > limit {
+            let size_gb = size as f64 / 1_000_000_000.0;
+            return Err(format!(
+                "Pesa {:.2} GB. Supera el límite de {} GB por archivo de Telegram ({})",
+                size_gb,
+                limit / 1_000_000_000,
+                if state.telegram.cached_snapshot().is_premium {
+                    "límite Telegram Premium"
+                } else {
+                    "cuenta estándar"
+                }
+            ));
+        }
+        let owned = state.clone();
+        let prepared_path = path.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            TransferService::prepare_upload_in_folder(
+                &owned.repository,
+                &prepared_path,
+                Some(&original_source),
+                false,
+                passphrase,
+                &owned.staging_dir,
+                folder_id.as_deref(),
+                delete_source_after_upload,
+            )
+        })
+        .await
+        .map_err(|e| e.to_string())?
     }
-    let owned = state.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        TransferService::prepare_upload_in_folder(
-            &owned.repository,
-            &path,
-            false,
-            passphrase,
-            &owned.staging_dir,
-            folder_id.as_deref(),
-        )
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    .await;
+
+    #[cfg(target_os = "android")]
+    if let Some(staged) = staged_android_source.as_deref() {
+        cleanup_android_staged_source(staged);
+    }
+
+    result
 }
 
 #[tauri::command]
-async fn sync_files(
-    state: State<'_, Arc<AppState>>,
-    full: Option<bool>,
-) -> Result<usize, String> {
+async fn sync_files(state: State<'_, Arc<AppState>>) -> Result<usize, String> {
     let _guard = state
         .sync_lock
         .try_lock()
         .map_err(|_| "Ya hay una sincronización en curso")?;
     let result = state
         .telegram
-        .sync_catalog_options(&state.repository, full.unwrap_or(false))
+        .sync_catalog_checked(&state.repository, true)
         .await;
     *state.background_error.lock().expect("background") = result.as_ref().err().cloned();
     result
@@ -494,12 +604,6 @@ pub fn build_directory_upload_plan(dir_path: &Path) -> Result<DirectoryUploadPla
                 folders_set.insert(rel_path.clone());
                 walk_dir(&path, root, folders_set, files, total_bytes)?;
             } else if metadata.is_file() {
-                if files.len() >= 500 {
-                    return Err(
-                        "La carpeta contiene más de 500 archivos. Para mantener la estabilidad del sistema, sube carpetas más pequeñas o comprímela en un archivo ZIP."
-                            .to_string(),
-                    );
-                }
                 let size = metadata.len();
                 *total_bytes += size;
                 if let Some(parent) = path.parent() {
@@ -737,26 +841,30 @@ async fn resume_queue(state: State<'_, Arc<AppState>>) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn set_trashed(state: State<'_, Arc<AppState>>, id: String, trashed: bool) -> Result<(), String> {
+async fn set_trashed(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    trashed: bool,
+) -> Result<(), String> {
+    let _guard = state.sync_lock.lock().await;
     state
-        .repository
-        .trash(&id, trashed)
-        .map_err(|e| e.to_string())
+        .telegram
+        .set_files_trashed_synced(&state.repository, &[id], trashed)
+        .await
+        .map(|_| ())
 }
 
 #[tauri::command]
-fn set_trashed_many(
+async fn set_trashed_many(
     state: State<'_, Arc<AppState>>,
     ids: Vec<String>,
     trashed: bool,
 ) -> Result<usize, String> {
-    if ids.len() > 500 {
-        return Err("Selecciona como máximo 500 archivos por operación".into());
-    }
+    let _guard = state.sync_lock.lock().await;
     state
-        .repository
-        .trash_many(&ids, trashed)
-        .map_err(|e| e.to_string())
+        .telegram
+        .set_files_trashed_synced(&state.repository, &ids, trashed)
+        .await
 }
 
 #[tauri::command]
@@ -795,7 +903,23 @@ async fn prepare_thumbnail(
     state: State<'_, Arc<AppState>>,
     id: String,
 ) -> Result<Option<media::ThumbnailSource>, String> {
-    static SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+    // Fast path for the progressive blurred preview captured during catalog sync.
+    // This is local SQLite only: no semaphore, settings lookup or Telegram request.
+    if let Ok(doc) = state.repository.remote(&id) {
+        if let Some(mini) = doc
+            .minithumbnail
+            .filter(|data| !data.is_empty() && data.len() <= 64 * 1024)
+        {
+            return Ok(Some(media::ThumbnailSource {
+                kind: "image".into(),
+                path: None,
+                data_url: Some(format!("data:image/jpeg;base64,{mini}")),
+                blurred: true,
+            }));
+        }
+    }
+
+    static SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
     let _slot = SLOTS.acquire().await.map_err(|e| e.to_string())?;
     let settings = state.repository.settings().map_err(|e| e.to_string())?;
     tokio::time::timeout(
@@ -923,6 +1047,7 @@ fn update_setting(
 ) -> Result<AppSettings, String> {
     match key.as_str() {
         "remember_session" if value == "0" || value == "1" => {}
+        "delete_original_after_upload" if value == "0" || value == "1" => {}
         "conflict_policy" if value == "skip" || value == "rename" => {}
         "cache_limit_bytes" => {
             let parsed: i64 = value.parse().map_err(|_| "Límite de caché inválido")?;
@@ -969,12 +1094,168 @@ async fn clear_mobile_notification(id: i32) -> Result<(), String> {
     mobile::clear_notification(id)
 }
 
+async fn delete_verified_upload_source_inner(
+    state: &Arc<AppState>,
+    transfer_id: &str,
+    require_opt_in: bool,
+) -> Result<bool, String> {
+    let Some(candidate) = state
+        .repository
+        .upload_source_cleanup(transfer_id, require_opt_in)
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(false);
+    };
+
+    let result: Result<bool, String> = if candidate.source_path.starts_with("content://") {
+        #[cfg(target_os = "android")]
+        {
+            mobile::delete_verified_document(
+                &candidate.source_path,
+                &candidate.sha256,
+                candidate.size_bytes,
+            )
+            .await
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            Err("Un URI de Android no se puede eliminar desde Windows".into())
+        }
+    } else {
+        let source = PathBuf::from(&candidate.source_path);
+        let expected_hash = candidate.sha256.clone();
+        let expected_size = candidate.size_bytes;
+        tauri::async_runtime::spawn_blocking(move || {
+            if !source.exists() {
+                return Ok(false);
+            }
+            let metadata = fs::metadata(&source).map_err(|e| e.to_string())?;
+            if !metadata.is_file() || metadata.len() != expected_size as u64 {
+                return Err(
+                    "El original cambió de tamaño después de la subida; se conservó por seguridad."
+                        .into(),
+                );
+            }
+            if sha256_file(&source).map_err(|e| e.to_string())? != expected_hash {
+                return Err(
+                    "El original cambió después de la subida; se conservó por seguridad.".into(),
+                );
+            }
+            fs::remove_file(&source)
+                .map_err(|e| format!("No se pudo borrar el original verificado: {e}"))?;
+            Ok(true)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    };
+
+    match result {
+        Ok(removed) => {
+            state
+                .repository
+                .mark_upload_source_deleted(transfer_id)
+                .map_err(|e| e.to_string())?;
+            Ok(removed)
+        }
+        Err(error) => {
+            let _ = state
+                .repository
+                .mark_upload_source_delete_error(transfer_id, &error);
+            Err(error)
+        }
+    }
+}
+
+#[tauri::command]
+async fn delete_verified_upload_source(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+) -> Result<bool, String> {
+    delete_verified_upload_source_inner(state.inner(), &id, false).await
+}
+
+fn uploaded_image_cleanup_candidates(
+    state: &AppState,
+) -> Result<Vec<repository::UploadSourceCleanupCandidate>, String> {
+    let mut seen_sources = std::collections::HashSet::new();
+    let candidates = state
+        .repository
+        .upload_source_cleanup_candidates()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|candidate| {
+            let extension = Path::new(&candidate.file_name)
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            cloud::classify_extension(&extension) == "image"
+                && seen_sources.insert(candidate.source_path.clone())
+        })
+        .collect();
+    Ok(candidates)
+}
+
+#[tauri::command]
+fn uploaded_image_cleanup_summary(
+    state: State<'_, Arc<AppState>>,
+) -> Result<UploadedImageCleanupSummary, String> {
+    let candidates = uploaded_image_cleanup_candidates(state.inner())?;
+    Ok(UploadedImageCleanupSummary {
+        count: candidates.len(),
+        bytes: candidates
+            .iter()
+            .map(|candidate| candidate.size_bytes.max(0))
+            .sum(),
+    })
+}
+
+#[tauri::command]
+async fn delete_uploaded_image_sources(
+    state: State<'_, Arc<AppState>>,
+) -> Result<UploadedImageCleanupResult, String> {
+    let state = state.inner().clone();
+    let candidates = uploaded_image_cleanup_candidates(&state)?;
+    let mut result = UploadedImageCleanupResult {
+        deleted: 0,
+        released_bytes: 0,
+        skipped: 0,
+        failed: 0,
+    };
+
+    for candidate in candidates {
+        let expected_release = if candidate.source_path.starts_with("content://") {
+            candidate.size_bytes.max(0)
+        } else {
+            fs::metadata(&candidate.source_path)
+                .ok()
+                .filter(|metadata| metadata.is_file())
+                .map(|metadata| metadata.len() as i64)
+                .unwrap_or(0)
+        };
+        match delete_verified_upload_source_inner(&state, &candidate.transfer_id, false).await {
+            Ok(true) => {
+                result.deleted += 1;
+                result.released_bytes = result
+                    .released_bytes
+                    .saturating_add(expected_release.min(candidate.size_bytes.max(0)));
+            }
+            Ok(false) => result.skipped += 1,
+            Err(_) => result.failed += 1,
+        }
+    }
+    Ok(result)
+}
+
 async fn run_job(state: Arc<AppState>, job: cloud::WorkItem) {
     let result = if job.direction == "upload" {
         state.telegram.run_upload(&state.repository, &job).await
     } else {
         state.telegram.run_download(&state.repository, &job).await
     };
+    if result.is_ok() && job.direction == "upload" {
+        let _ = delete_verified_upload_source_inner(&state, &job.id, true).await;
+    }
     if let Err(error) = result {
         let current = state
             .repository
@@ -995,62 +1276,55 @@ async fn run_job(state: Arc<AppState>, job: cloud::WorkItem) {
     }
 }
 
-// Native polling stays alive when Android suspends the WebView. Do not put this
-// in worker(), which awaits catalog synchronization and would stall upload updates.
-#[cfg(target_os = "android")]
-fn notification_worker(state: Arc<AppState>) {
-    let mut uploads = upload_notifications::UploadTracker::default();
-    let mut sync_was_active = false;
-    loop {
-        if let Ok(jobs) = state.repository.list_transfers() {
-            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
-            if let Some(notice) = uploads.snapshot(&jobs, now) {
-                if let Err(error) = mobile::update_upload_notification(&serde_json::to_value(notice).unwrap_or_default()) {
-                    eprintln!("Android upload notification: {error}");
-                }
-            }
-        }
-        let sync = state.telegram.sync_progress.lock().expect("sync progress").clone();
-        if sync.active || sync_was_active {
-            if let Err(error) = mobile::update_sync_notification(&serde_json::to_value(&sync).unwrap_or_default()) {
-                eprintln!("Android sync notification: {error}");
-            }
-        }
-        sync_was_active = sync.active;
-        std::thread::sleep(Duration::from_secs(1));
-    }
-}
-
 async fn worker(state: Arc<AppState>) {
     let settings = state.repository.settings().unwrap_or_default();
     if let Err(error) = state.telegram.initialize(settings.remember_session).await {
         *state.background_error.lock().expect("background") = Some(error);
     }
-    let mut initial_synced = false;
-    let mut last_sync = std::time::Instant::now();
+    let mut bootstrap_checked = false;
     loop {
         tokio::time::sleep(Duration::from_millis(350)).await;
         let _ = state.repository.release_due_retries();
         if !state.telegram.cached_snapshot().connected {
-            initial_synced = false;
+            // A later login may point to a different Telegram account/chat, whose
+            // bootstrap marker is scoped independently.
+            bootstrap_checked = false;
             continue;
         }
 
-        let should_sync = !initial_synced || last_sync.elapsed() >= Duration::from_secs(180);
-        if should_sync {
-            if let Ok(_guard) = state.sync_lock.try_lock() {
-                match state.telegram.sync_catalog(&state.repository).await {
-                    Ok(_) => {
-                        initial_synced = true;
-                        last_sync = std::time::Instant::now();
-                        *state.background_error.lock().expect("background") = None;
+        // Startup is local-first. Only a genuinely new account/catalog performs one
+        // automatic bootstrap. Existing installations load SQLite immediately and do
+        // not hit Telegram again until the user presses Sincronizar (or an upload
+        // recovery path explicitly needs remote confirmation).
+        if !bootstrap_checked {
+            match state.repository.catalog_bootstrap_required_locally() {
+                Ok(false) => {
+                    // Existing catalog: startup remains fully local. Do not touch the
+                    // Telegram catalog until the user explicitly presses Sincronizar.
+                    bootstrap_checked = true;
+                }
+                Ok(true) => {
+                    if let Ok(_guard) = state.sync_lock.try_lock() {
+                        match state
+                            .telegram
+                            .bootstrap_catalog_if_needed(&state.repository)
+                            .await
+                        {
+                            Ok(_) => {
+                                bootstrap_checked = true;
+                                *state.background_error.lock().expect("background") = None;
+                            }
+                            Err(error) => {
+                                *state.background_error.lock().expect("background") = Some(error);
+                                tokio::time::sleep(Duration::from_secs(5)).await;
+                                continue;
+                            }
+                        }
                     }
-                    Err(error) => {
-                        *state.background_error.lock().expect("background") = Some(error);
-                        last_sync = std::time::Instant::now();
-                        tokio::time::sleep(Duration::from_secs(5)).await;
-                        continue;
-                    }
+                }
+                Err(error) => {
+                    *state.background_error.lock().expect("background") = Some(error);
+                    bootstrap_checked = true;
                 }
             }
         }
@@ -1181,15 +1455,12 @@ async fn telegram_configure(
 async fn telegram_submit_phone(
     state: State<'_, Arc<AppState>>,
     phone: String,
+    delivery: Option<String>,
 ) -> Result<TelegramAuthSnapshot, String> {
-    state.telegram.submit_phone(phone).await
-}
-#[tauri::command]
-async fn telegram_submit_phone_sms(
-    state: State<'_, Arc<AppState>>,
-    phone: String,
-) -> Result<TelegramAuthSnapshot, String> {
-    state.telegram.submit_phone_sms(phone).await
+    state
+        .telegram
+        .submit_phone(phone, delivery.as_deref().unwrap_or("telegram"))
+        .await
 }
 #[tauri::command]
 async fn telegram_reset_to_phone(
@@ -1221,8 +1492,9 @@ async fn telegram_submit_code(
 #[tauri::command]
 async fn telegram_resend_code(
     state: State<'_, Arc<AppState>>,
+    delivery: Option<String>,
 ) -> Result<TelegramAuthSnapshot, String> {
-    state.telegram.resend_code().await
+    state.telegram.resend_code(delivery.as_deref()).await
 }
 #[tauri::command]
 async fn telegram_submit_password(
@@ -1283,80 +1555,53 @@ fn directory_size(path: &Path) -> std::io::Result<u64> {
     Ok(total)
 }
 
-// Keystore calls wait for Android callbacks; never run this on the setup/event-loop thread.
-fn initialize_state(app: &tauri::AppHandle) -> Result<Arc<AppState>, String> {
-    let app_data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("unable to resolve app data directory: {error}"))?;
-    fs::create_dir_all(&app_data_dir)
-        .map_err(|error| format!("unable to create app data directory: {error}"))?;
-    let staging_dir = app_data_dir.join("staging");
-    let media_cache_dir = app
-        .path()
-        .app_cache_dir()
-        .map_err(|error| format!("unable to resolve app cache directory: {error}"))?
-        .join("media");
-    fs::create_dir_all(&staging_dir).map_err(|error| error.to_string())?;
-    fs::create_dir_all(&media_cache_dir).map_err(|error| error.to_string())?;
-
-    let repository = CatalogRepository::open(&app_data_dir.join("nuvio.db"))
-        .map_err(|error| error.to_string())?;
-    repository.init_cloud().map_err(|error| error.to_string())?;
-    let settings = repository.settings().map_err(|e| e.to_string())?;
-    let telegram = TelegramService::new(&app_data_dir)?;
-    let state = Arc::new(AppState {
-        repository,
-        telegram,
-        staging_dir,
-        media_cache_dir,
-        preparation_slots: Arc::new(tokio::sync::Semaphore::new(
-            settings.preparation_concurrency,
-        )),
-        cache_usage: Mutex::new((std::time::Instant::now() - Duration::from_secs(31), 0)),
-        upload_slots: Arc::new(tokio::sync::Semaphore::new(16)),
-        download_slots: Arc::new(tokio::sync::Semaphore::new(settings.download_concurrency)),
-        sync_lock: tokio::sync::Mutex::new(()),
-        background_error: Mutex::new(None),
-    });
-    Ok(state)
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .manage(startup::Startup::default())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(mobile::init())
         .setup(|app| {
-            let handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                let initializer = handle.clone();
-                let _ = mobile::update_sync_notification(&serde_json::json!({"active": true, "phase": "startup", "scanned": 0}));
-                let result = tauri::async_runtime::spawn_blocking(move || initialize_state(&initializer))
-                    .await
-                    .map_err(|error| format!("No se pudo iniciar Nuvio: {error}"))
-                    .and_then(|result| result);
-                let _ = mobile::update_sync_notification(&serde_json::json!({"active": false, "phase": "startup", "scanned": 0}));
-                match result {
-                    Ok(state) => {
-                        handle.manage(state.clone());
-                        handle.state::<startup::Startup>().finish(Ok(()));
-                        #[cfg(target_os = "android")]
-                        {
-                            let notifications = state.clone();
-                            tauri::async_runtime::spawn_blocking(move || notification_worker(notifications));
-                        }
-                        tauri::async_runtime::spawn(worker(state));
-                    }
-                    Err(error) => handle.state::<startup::Startup>().finish(Err(format!(
-                        "No se pudo preparar el almacenamiento de Nuvio: {error}. Cierra y vuelve a abrir la aplicación."
-                    ))),
-                }
+            let app_data_dir = app
+                .path()
+                .app_data_dir()
+                .map_err(|error| format!("unable to resolve app data directory: {error}"))?;
+            fs::create_dir_all(&app_data_dir)
+                .map_err(|error| format!("unable to create app data directory: {error}"))?;
+            let staging_dir = app_data_dir.join("staging");
+            let media_cache_dir = app
+                .path()
+                .app_cache_dir()
+                .map_err(|error| format!("unable to resolve app cache directory: {error}"))?
+                .join("media");
+            fs::create_dir_all(&staging_dir).map_err(|error| error.to_string())?;
+            fs::create_dir_all(&media_cache_dir).map_err(|error| error.to_string())?;
+
+            let repository = CatalogRepository::open(&app_data_dir.join("nuvio.db"))
+                .map_err(|error| error.to_string())?;
+            repository.init_cloud()?;
+            let settings = repository.settings().map_err(|e| e.to_string())?;
+            let telegram = TelegramService::new(&app_data_dir)?;
+            let state = Arc::new(AppState {
+                repository,
+                telegram,
+                staging_dir,
+                media_cache_dir,
+                preparation_slots: Arc::new(tokio::sync::Semaphore::new(
+                    settings.preparation_concurrency,
+                )),
+                cache_usage: Mutex::new((std::time::Instant::now() - Duration::from_secs(31), 0)),
+                upload_slots: Arc::new(tokio::sync::Semaphore::new(16)),
+                download_slots: Arc::new(tokio::sync::Semaphore::new(
+                    settings.download_concurrency,
+                )),
+                sync_lock: tokio::sync::Mutex::new(()),
+                background_error: Mutex::new(None),
             });
+            app.manage(state.clone());
+            tauri::async_runtime::spawn(worker(state));
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -1371,7 +1616,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_dashboard,
+            get_sync_delta,
             set_favorite,
+            analyze_upload_selection,
             prepare_zip_uploads,
             prepare_upload,
             scan_directory_for_upload,
@@ -1404,11 +1651,13 @@ pub fn run() {
             clear_media_cache_command,
             clear_transfer_history,
             export_diagnostics,
+            delete_verified_upload_source,
+            uploaded_image_cleanup_summary,
+            delete_uploaded_image_sources,
             update_setting,
             telegram_auth_state,
             telegram_configure,
             telegram_submit_phone,
-            telegram_submit_phone_sms,
             telegram_reset_to_phone,
             telegram_submit_email,
             telegram_submit_email_code,
@@ -1505,19 +1754,5 @@ mod tests {
         let file_path = temp.path().join("file.txt");
         fs::write(&file_path, b"not a dir").unwrap();
         assert!(build_directory_upload_plan(&file_path).is_err());
-    }
-
-    #[test]
-    fn test_build_directory_upload_plan_rejects_more_than_500_files() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("many_files");
-        fs::create_dir_all(&root).unwrap();
-        for i in 0..501 {
-            fs::write(root.join(format!("f_{i}.txt")), b"x").unwrap();
-        }
-        let result = build_directory_upload_plan(&root);
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.contains("500 archivos"));
     }
 }
