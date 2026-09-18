@@ -427,6 +427,7 @@ function modernizeAndroidProject() {
   const tauriBuild = join(androidRoot, "app", "tauri.build.gradle.kts");
   const gradleProperties = join(androidRoot, "gradle.properties");
   const wrapper = join(androidRoot, "gradle", "wrapper", "gradle-wrapper.properties");
+  const notificationQaBuild = join(androidRoot, "notification-qa", "build.gradle.kts");
 
   if (![rootBuild, appBuild, buildSrcBuild, buildTask, gradleProperties, wrapper].every(existsSync)) return;
 
@@ -482,6 +483,26 @@ function modernizeAndroidProject() {
     );
   }
   writeFileSync(appBuild, app, "utf8");
+
+  if (existsSync(notificationQaBuild)) {
+    let notificationQa = readFileSync(notificationQaBuild, "utf8").replace(
+      /\r?\n\s*kotlinOptions\s*\{\s*jvmTarget\s*=\s*"[^"]+"\s*\}/g,
+      "",
+    );
+    if (!notificationQa.includes("sourceCompatibility = JavaVersion.VERSION_17")) {
+      notificationQa = notificationQa.replace(
+        /\r?\n\s*sourceSets\["main"\]\.java\.srcDir\(layout\.buildDirectory\.dir\("production"\)\)/,
+        `\r\n    sourceSets["main"].java.srcDir(layout.buildDirectory.dir("production"))\r\n    compileOptions {\r\n        sourceCompatibility = JavaVersion.VERSION_17\r\n        targetCompatibility = JavaVersion.VERSION_17\r\n    }`,
+      );
+    }
+    if (!notificationQa.includes("JvmTarget.fromTarget(\"17\")")) {
+      notificationQa = notificationQa.replace(
+        /\r?\n}\r?\nval copyProductionNotifications/,
+        `\r\n}\r\n\r\nkotlin {\r\n    compilerOptions {\r\n        jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.fromTarget("17")\r\n    }\r\n}\r\nval copyProductionNotifications`,
+      );
+    }
+    writeFileSync(notificationQaBuild, notificationQa, "utf8");
+  }
 
   const buildSrc = readFileSync(buildSrcBuild, "utf8")
     .replace(/com\.android\.tools\.build:gradle:[^"\r\n]+/g, "com.android.tools.build:gradle:8.11.1");

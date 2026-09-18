@@ -14,7 +14,16 @@ android {
         testInstrumentationRunner = "com.nuvio.notificationqa.NotificationInstrumentation"
     }
     sourceSets["main"].java.srcDir(layout.buildDirectory.dir("production"))
-    kotlinOptions { jvmTarget = "1.8" }
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+}
+
+kotlin {
+    compilerOptions {
+        jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.fromTarget("17")
+    }
 }
 val copyProductionNotifications by tasks.registering(Copy::class) {
     from("../app/src/main/java/com/nuvio/drive") {
