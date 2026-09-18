@@ -2,6 +2,9 @@
 <resources>
     <style name="Theme.nuviodrive_v1" parent="Theme.MaterialComponents.DayNight.NoActionBar">
         <item name="android:windowBackground">@drawable/nuvio_startup</item>
+        <item name="android:windowSplashScreenBackground">#17191F</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@drawable/nuvio_startup_icon</item>
+        <item name="android:windowSplashScreenAnimationDuration">200</item>
         <item name="android:statusBarColor">#17191F</item>
         <item name="android:navigationBarColor">#17191F</item>
         <item name="android:windowLightStatusBar">false</item>

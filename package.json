@@ -20,6 +20,7 @@
     "android:dev": "node scripts/tauri-android.mjs dev",
     "android:build": "node scripts/tauri-android.mjs build --debug --apk --target aarch64",
     "android:release": "node scripts/tauri-android.mjs build --apk --target aarch64",
+    "android:google-play": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-google-play.ps1",
     "qa:auth": "node scripts/qa-auth.mjs"
   },
   "dependencies": {

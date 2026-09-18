@@ -343,17 +343,24 @@ function windowsNoSymlinkFallback(env, tauriResult) {
 }
 
 function installNuvioMobilePlugin() {
-  const source = join(projectRoot, "android", "NuvioMobilePlugin.kt");
-  if (!existsSync(source)) throw new Error(`Falta el plugin Android persistente: ${source}`);
-  const destination = join(projectRoot, "src-tauri", "gen", "android", "app", "src", "main", "java", "com", "nuvio", "drive", "NuvioMobilePlugin.kt");
-  mkdirSync(dirname(destination), { recursive: true });
-  copyFileSync(source, destination);
+  const javaDirectory = join(projectRoot, "src-tauri", "gen", "android", "app", "src", "main", "java", "com", "nuvio", "drive");
+  mkdirSync(javaDirectory, { recursive: true });
+  for (const name of ["NuvioMobilePlugin.kt", "MainActivity.kt", "NuvioForegroundService.kt", "NuvioNotificationContent.kt"]) {
+    const source = join(projectRoot, "android", name);
+    if (!existsSync(source)) throw new Error(`Falta la fuente Android persistente: ${source}`);
+    copyFileSync(source, join(javaDirectory, name));
+  }
 }
 
 function installAndroidNotificationPermission() {
   const manifest = join(projectRoot, "src-tauri", "gen", "android", "app", "src", "main", "AndroidManifest.xml");
   if (!existsSync(manifest)) return;
-  const permission = '<uses-permission android:name="android.permission.POST_NOTIFICATIONS" />';
+  const permissions = [
+    '<uses-permission android:name="android.permission.POST_NOTIFICATIONS" />',
+    '<uses-permission android:name="android.permission.FOREGROUND_SERVICE" />',
+    '<uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />',
+    '<uses-permission android:name="android.permission.WAKE_LOCK" />',
+  ];
   const internet = '<uses-permission android:name="android.permission.INTERNET" />';
   const current = readFileSync(manifest, "utf8");
   let next = current;
@@ -367,10 +374,19 @@ function installAndroidNotificationPermission() {
     .replace(/^[ \t]*<uses-feature android:name="android\.software\.leanback"[^>]*\/>[ \t]*\r?\n/gm, "")
     .replace(/^[ \t]*<category android:name="android\.intent\.category\.LEANBACK_LAUNCHER"[ \t]*\/>[ \t]*\r?\n/gm, "");
 
-  if (!next.includes("android.permission.POST_NOTIFICATIONS")) {
+  for (const permission of permissions) {
+    const permissionName = permission.match(/android:name="([^"]+)"/)?.[1];
+    if (!permissionName || next.includes(permissionName)) continue;
     next = next.includes(internet)
       ? next.replace(internet, `${internet}\r\n    ${permission}`)
       : next.replace(/<manifest([^>]*)>/, `<manifest$1>\r\n    ${permission}`);
+  }
+
+  if (!next.includes('android:name=".NuvioForegroundService"')) {
+    const service = '        <service android:name=".NuvioForegroundService" android:exported="false" android:foregroundServiceType="dataSync" />';
+    next = next.includes("        <provider")
+      ? next.replace("        <provider", `${service}\r\n\r\n        <provider`)
+      : next.replace("    </application>", `${service}\r\n    </application>`);
   }
   if (next !== current) writeFileSync(manifest, next, "utf8");
 }
@@ -447,16 +463,22 @@ function modernizeAndroidProject() {
       'id("com.android.application")\r\n    id("org.jetbrains.kotlin.android")',
     );
   }
+  // Kotlin 2.x deprecates android.kotlinOptions. Remove Tauri's generated
+  // legacy block(s) and configure JVM 17 through kotlin.compilerOptions instead.
+  app = app.replace(
+    /\r?\n\s*kotlinOptions\s*\{\s*\r?\n\s*jvmTarget\s*=\s*"[^"]+"\s*\r?\n\s*\}/g,
+    "",
+  );
   if (!app.includes("sourceCompatibility = JavaVersion.VERSION_17")) {
     app = app.replace(
       /\r?\n\s*buildFeatures\s*\{/,
       `\r\n    compileOptions {\r\n        sourceCompatibility = JavaVersion.VERSION_17\r\n        targetCompatibility = JavaVersion.VERSION_17\r\n    }\r\n    buildFeatures {`,
     );
   }
-  if (!app.includes('jvmTarget = "17"')) {
+  if (!app.includes("JvmTarget.fromTarget(\"17\")")) {
     app = app.replace(
-      /\r?\n\s*buildFeatures\s*\{/,
-      `\r\n    kotlinOptions {\r\n        jvmTarget = "17"\r\n    }\r\n    buildFeatures {`,
+      /\r?\n}\r?\n\r?\nrust\s*\{/,
+      `\r\n}\r\n\r\nkotlin {\r\n    compilerOptions {\r\n        jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.fromTarget("17")\r\n    }\r\n}\r\n\r\nrust {`,
     );
   }
   writeFileSync(appBuild, app, "utf8");
@@ -570,17 +592,17 @@ console.log(`[Nuvio Android] NDK: ${ndkRoot}`);
 console.log(`[Nuvio Android] JDK: ${java17}`);
 
 if (command !== "init") {
-  installNuvioMobilePlugin();
   installAndroidNotificationPermission();
   installAndroidStartupAppearance();
+  installNuvioMobilePlugin();
   modernizeAndroidProject();
 }
 const releaseBuildLock = acquireBuildLock();
 let result = await runPnpmTauri(env);
 if (command === "init" && (result.status ?? 1) === 0) {
-  installNuvioMobilePlugin();
   installAndroidNotificationPermission();
   installAndroidStartupAppearance();
+  installNuvioMobilePlugin();
   modernizeAndroidProject();
 }
 

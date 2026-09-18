@@ -1,5 +1,17 @@
 # Historial de Nuvio
 
+## 1.2.4 — 2026-09-17
+
+- Paridad funcional con la release Windows 1.2.4: archivos individuales de más de 2 GB se convierten en volúmenes ZIP independientes por debajo del límite de Telegram, con nombres descriptivos, manifiesto `NUVIO-SPLIT-MANIFEST.json`, formato `nuvio-split-v1` y SHA-256 por parte y del archivo completo.
+- Preparación de archivos grandes completamente en streaming, con bloques de 1 MiB, validación de cada ZIP y detección de cambios del archivo fuente durante el proceso.
+- Refactorización del frontend compartido: `App.tsx` delega sincronización, ciclo del dashboard, subidas, transferencias, carpetas, papelera, mantenimiento, previews y drag & drop en hooks especializados.
+- Bridge de Tauri dividido por dominio (`dashboard`, `files`, `media`, `mobile`, `settings`, `telegram`, `transfers`, `uploads`) manteniendo `bridge.ts` como fachada compatible.
+- Se mantienen y endurecen las capacidades exclusivas de Android: SAF, servicio foreground de sincronización/subidas, notificaciones persistentes, wake lock, manejo de insets/teclado, botón Atrás seguro y flujo de distribución para Google Play.
+- Las fuentes Kotlin críticas de Android ahora viven también bajo `android/` y el generador las restaura en cada build, evitando que Tauri regenere y pierda personalizaciones móviles.
+- Empaquetado Android reforzado para permisos de notificación, `FOREGROUND_SERVICE`, `FOREGROUND_SERVICE_DATA_SYNC`, `WAKE_LOCK`, servicio de datos y compatibilidad de páginas de 16 KB.
+- Flujo de Google Play corregido para eliminar bundles obsoletos antes de compilar y seleccionar únicamente el AAB recién generado, evitando publicar accidentalmente un artefacto antiguo.
+- Validación de release: TypeScript y Vite correctos, autenticación 20/20, Rust 86/86, Clippy sin warnings de código propio y UI 31/31. El APK ARM64 1.2.4 se verificó firmado, no depurable y compatible con páginas de 16 KB.
+
 ## 1.2.0 — 2026-09-11
 
 - Opción de compresión previa en ZIP con límite estricto de 2 GB por paquete (integrada en subida de archivos, carpetas y arrastre externo desde PC).
